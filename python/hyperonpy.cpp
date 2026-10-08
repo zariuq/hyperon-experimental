@@ -4,6 +4,7 @@
 #include <fstream>
 #include <iostream>
 #include <sstream>
+#include <vector>
 
 #include <hyperon/hyperon.h>
 
@@ -62,12 +63,11 @@ std::string func_to_string(write_to_buf_func_t func, void* arg) {
     char dst_buf[1024];
     size_t len = func(arg, dst_buf, 1024);
     if (len < 1024) {
-        return std::string(dst_buf);
+        return std::string(dst_buf, len);
     } else {
-        char* data = new char[len+1];
-        func(arg, data, len+1);
-        std::string new_string = std::string(data);
-        return new_string;
+        std::vector<char> data(len+1);
+        func(arg, data.data(), data.size());
+        return std::string(data.data(), len);
     }
 }
 
@@ -78,12 +78,11 @@ std::string func_to_string_no_arg(write_to_buf_no_arg_func_t func) {
     char dst_buf[1024];
     size_t len = func(dst_buf, 1024);
     if (len < 1024) {
-        return std::string(dst_buf);
+        return std::string(dst_buf, len);
     } else {
-        char* data = new char[len+1];
-        func(data, len+1);
-        std::string new_string = std::string(data);
-        return new_string;
+        std::vector<char> data(len+1);
+        func(data.data(), data.size());
+        return std::string(data.data(), len);
     }
 }
 
@@ -92,6 +91,21 @@ static void copy_atoms(const atom_vec_t* atoms, void* context) {
     for (size_t i = 0; i < atom_vec_len(atoms); ++i) {
         atom_ref_t atom = atom_vec_get(atoms, i);
         list->append(CAtom(atom_clone(&atom)));
+    }
+}
+
+static void copy_type_error(const atom_vec_t* atoms, void* context) {
+    auto& message = *static_cast<std::string*>(context);
+    atom_ref_t error = atom_vec_get(atoms, 0);
+    message = func_to_string((write_to_buf_func_t)&atom_to_str, &error);
+}
+
+static void throw_context_error(run_context_t* context) {
+    const char* error = run_context_err_str(context);
+    if (error != nullptr) {
+        std::string message(error);
+        run_context_clear_error(context);
+        throw std::runtime_error(message);
     }
 }
 
@@ -552,9 +566,19 @@ struct python_module_loader_t {
 };
 
 void module_loader_save_last_error(py::error_already_set &e, write_t err) {
-    char message[4096];
-    snprintf(message, lenghtof(message), "Exception caught:\n%s", e.what());
-    write_str(err, message);
+    std::string message = "Exception caught:\n";
+    const std::string value = py::str(e.value()).cast<std::string>();
+    if (value.find('\0') == std::string::npos) {
+        message += e.what();
+    } else {
+        message += py::str(e.type()).cast<std::string>();
+        message += ": ";
+        for (char character : value) {
+            if (character == '\0') { message += "\\0"; }
+            else { message += character; }
+        }
+    }
+    write_str(err, message.c_str());
 }
 
 ssize_t module_loader_load(void const* pyloader, run_context_t* run_context, write_t err) {
@@ -971,7 +995,9 @@ PYBIND11_MODULE(hyperonpy, m) {
     m.def("tokenizer_free", [](CTokenizer tokenizer) { tokenizer_free(tokenizer.obj); }, "Free tokenizer");
     m.def("tokenizer_clone", [](CTokenizer tokenizer) { tokenizer_clone(tokenizer.ptr()); }, "Clone tokenizer");
     m.def("tokenizer_register_token", [](CTokenizer tokenizer, char const* regex, py::function constr) {
-            tokenizer_register_token(tokenizer.ptr(), regex, &TOKEN_API, new CConstr(constr));
+            if (!tokenizer_register_token(tokenizer.ptr(), regex, &TOKEN_API, new CConstr(constr))) {
+                throw std::runtime_error(std::string("Invalid regular expression of the token: ") + regex);
+            }
         }, "Register token");
 
     py::enum_<syntax_node_type_t>(m, "SyntaxNodeType")
@@ -1045,10 +1071,16 @@ PYBIND11_MODULE(hyperonpy, m) {
         ADD_TYPE(BOOL, "Bool")
         ADD_TYPE(STRING, "String");
     m.def("check_type", [](CSpace space, CAtom& atom, CAtom& type) {
-            return check_type(space.ptr(), atom.ptr(), type.ptr());
+            std::string error;
+            bool result = check_type_with_error(space.ptr(), atom.ptr(), type.ptr(), copy_type_error, &error);
+            if (!error.empty()) { throw std::runtime_error(error); }
+            return result;
         }, "Check if atom is an instance of the passed type");
     m.def("validate_atom", [](CSpace space, CAtom& atom) {
-            return validate_atom(space.ptr(), atom.ptr());
+            std::string error;
+            bool result = validate_atom_with_error(space.ptr(), atom.ptr(), copy_type_error, &error);
+            if (!error.empty()) { throw std::runtime_error(error); }
+            return result;
         }, "Validate expression arguments correspond to the operation type");
     m.def("get_atom_types", [](CSpace space, CAtom& atom) {
             py::list atoms;
@@ -1068,7 +1100,9 @@ PYBIND11_MODULE(hyperonpy, m) {
         run_context_init_self_module(run_context.ptr, space.ptr(), resource_dir);
     }, "Init module in loader");
     m.def("run_context_load_module", [](CRunContext& run_context, const char* mod_name) {
-        return ModuleId(run_context_load_module(run_context.ptr, mod_name));
+        auto result = run_context_load_module(run_context.ptr, mod_name);
+        throw_context_error(run_context.ptr);
+        return ModuleId(result);
     }, "Load a module by name");
     m.def("run_context_get_metta", [](CRunContext& run_context) {
         return CMetta(run_context_get_metta(run_context.ptr));
@@ -1082,6 +1116,7 @@ PYBIND11_MODULE(hyperonpy, m) {
 
     m.def("run_context_import_dependency", [](CRunContext& run_context, ModuleId mod_id) {
         run_context_import_dependency(run_context.ptr, mod_id.obj);
+        throw_context_error(run_context.ptr);
     }, "Imports a dependency into a module");
 
     py::class_<CModuleDescriptor>(m, "CModuleDescriptor");

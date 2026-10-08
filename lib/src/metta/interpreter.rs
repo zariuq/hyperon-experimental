@@ -51,7 +51,6 @@ macro_rules! call_native {
 type ReturnHandler = fn(Rc<RefCell<Stack>>, Atom, Bindings) -> Option<(Stack, Bindings)>;
 
 #[derive(Debug, Clone)]
-#[cfg_attr(test, derive(PartialEq))]
 struct Stack {
     // Internal mutability is required to implement collapse-bind. All alternatives
     // reference the same collapse-bind Stack instance. When some alternative
@@ -65,6 +64,16 @@ struct Stack {
     finished: bool,
     vars: Variables,
     depth: usize,
+}
+
+#[cfg(test)]
+impl PartialEq for Stack {
+    fn eq(&self, other: &Self) -> bool {
+        // Tests compare stack layouts and handler addresses, not function semantics.
+        self.prev == other.prev && self.atom == other.atom
+            && std::ptr::fn_addr_eq(self.ret, other.ret)
+            && self.finished == other.finished && self.vars == other.vars && self.depth == other.depth
+    }
 }
 
 fn no_handler(_stack: Rc<RefCell<Stack>>, _atom: Atom, _bindings: Bindings) -> Option<(Stack, Bindings)> {
@@ -179,6 +188,7 @@ pub struct InterpreterState {
     context: InterpreterContext,
     /// Maximum stack depth
     max_stack_depth: usize,
+    max_type_depth: usize,
 }
 
 fn atom_as_slice(atom: &Atom) -> Option<&[Atom]> {
@@ -202,6 +212,7 @@ impl InterpreterState {
             finished: results,
             context: InterpreterContext::new(space),
             max_stack_depth: 0,
+            max_type_depth: type_search_depth(),
         }
     }
 
@@ -237,6 +248,11 @@ impl InterpreterState {
     pub fn set_max_stack_depth(&mut self, depth: usize) {
         self.max_stack_depth = depth;
     }
+
+    /// Bound subtype search independently of interpreter stack depth.
+    pub fn set_max_type_depth(&mut self, depth: usize) {
+        self.max_type_depth = depth;
+    }
 }
 
 impl std::fmt::Display for InterpreterState {
@@ -258,6 +274,7 @@ pub fn interpret_init(space: DynSpace, expr: &Atom) -> InterpreterState {
         finished: vec![],
         context,
         max_stack_depth: 0,
+        max_type_depth: type_search_depth(),
     }
 }
 
@@ -267,6 +284,7 @@ pub fn interpret_init(space: DynSpace, expr: &Atom) -> InterpreterState {
 /// # Arguments
 /// * `state` - interpreter state from the previous step.
 pub fn interpret_step(mut state: InterpreterState) -> InterpreterState {
+    let _type_search_scope = scoped_type_search_depth(state.max_type_depth);
     let interpreted_atom = state.pop().unwrap();
     log::debug!("interpret_step:\n{}", interpreted_atom);
     let InterpretedAtom(stack, bindings) = interpreted_atom;
@@ -869,6 +887,14 @@ fn cons_atom(stack: Stack, bindings: Bindings) -> Vec<InterpretedAtom> {
     finished_result(Atom::expr(children), bindings, prev)
 }
 
+fn is_atom_bindings_pair(pair: &Atom) -> bool {
+    match pair {
+        Atom::Expression(expr) => expr.children().len() == 2
+            && expr.children()[1].as_gnd::<Bindings>().is_some(),
+        _ => false,
+    }
+}
+
 fn atom_into_atom_bindings(pair: Atom) -> (Atom, Bindings) {
     match_atom!{
         pair ~ [atom, bindings] => (atom, atom_into_bindings(bindings)),
@@ -893,9 +919,9 @@ fn atom_into_bindings(bindings: Atom) -> Bindings {
 fn superpose_bind(stack: Stack, bindings: Bindings) -> Vec<InterpretedAtom> {
     let Stack{ prev, atom: superpose, .. } = stack;
     let collapsed = match_atom!{
-        superpose ~ [_op, Atom::Expression(collapsed)] => collapsed,
+        superpose ~ [_op, Atom::Expression(collapsed)] if collapsed.children().iter().all(is_atom_bindings_pair) => collapsed,
         _ => {
-            let error: String = format!("expected: ({} (: <collapsed> Expression)), found: {}", SUPERPOSE_BIND_SYMBOL, superpose);
+            let error: String = format!("expected: ({} (: <collapsed> Expression)), where <collapsed> is a list of (<atom> <bindings>) pairs, found: {}", SUPERPOSE_BIND_SYMBOL, superpose);
             return finished_result(error_msg(superpose, error), bindings, prev);
         }
     };
@@ -1033,10 +1059,15 @@ fn get_meta_type(atom: &Atom) -> Atom {
 
 fn type_cast(space: Atom, atom: Atom, expected_type: Atom, bindings: Bindings) -> MettaResult {
     let space = space.as_gnd::<DynSpace>().unwrap();
-    let types = get_atom_types(space, &atom);
+    let types = iter_atom_types(space, &atom);
 
-    let mut errors = Vec::with_capacity(types.len());
-    for actual_type in types.into_iter().filter(AtomType::is_valid).map(AtomType::into_atom) {
+    let mut errors = Vec::new();
+    for actual_type in types {
+        if actual_type.is_search_limit() {
+            return once((return_atom(actual_type.into_error_unchecked()), bindings));
+        }
+        if !actual_type.is_valid() { continue; }
+        let actual_type = actual_type.into_atom();
         let res = match_types(&expected_type, &actual_type, bindings.clone());
         match res {
             Ok(it) => return Box::new(it.map(move |b| (return_atom(atom.clone()), b))),
@@ -1161,6 +1192,9 @@ fn interpret_expression(args: Atom, bindings: Bindings) -> MettaResult {
                         },
                         (Err(err), bindings) => errors.push((err, bindings)),
                     }
+                }
+                if errors.iter().any(|(error, _)| is_type_search_limit_error(error)) {
+                    errors.retain(|(error, _)| is_type_search_limit_error(error));
                 }
                 Box::new(errors.into_iter()
                     .map(move |(err, bindings)| (return_atom(err), bindings)))
@@ -1319,8 +1353,7 @@ fn check_if_function_type_is_applicable_<'a>(expr: &'a Atom, op_type: &'a Atom,
             if is_meta_type(formal_arg_type) && match_meta_types(&get_meta_type(actual_arg), formal_arg_type) {
                 check_if_function_type_is_applicable_(expr, op_type, actual_args, arg_types, expected_type, space, bindings)
             } else {
-                let actual_arg_types = get_atom_types(space, actual_arg)
-                    .into_iter()
+                let actual_arg_types = iter_atom_types(space, actual_arg)
                     .inspect(move |typ| log::trace!("check_if_function_type_is_applicable_: function type check: expr: {}, actual_arg: {}, actual_type: {}", expr, actual_arg, typ));
                 let iter = actual_arg_types.flat_map(move |actual_arg_type| -> Box<dyn Iterator<Item=(Result<(Atom, Atom), Atom>, Bindings)> + '_> {
                     match actual_arg_type.into_atom_or_error() {
@@ -1806,6 +1839,17 @@ mod tests {
                 Stack{ prev: None, atom: expr!("foo" a b), ret: no_handler, finished: true, vars: Variables::new(), depth: 1 },
                 bind!{ a: expr!("A"), b: expr!("B"), c: expr!("C"), d: expr!("D") }
         )]);
+    }
+
+    #[test]
+    fn interpret_superpose_bind_incorrect_pairs() {
+        for program in ["(superpose-bind (foo))", "(superpose-bind ((foo bar)))", "(superpose-bind ((foo)))"] {
+            let result = call_interpret(space(""), &metta_atom(program));
+            assert_eq!(result.len(), 1, "{}", program);
+            assert!(atom_is_error(&result[0]), "{}", program);
+        }
+        let result = call_interpret(space(""), &metta_atom("(superpose-bind ())"));
+        assert_eq!(result, vec![]);
     }
 
     #[test]

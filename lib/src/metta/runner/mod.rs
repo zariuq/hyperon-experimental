@@ -129,6 +129,14 @@ impl PragmaSettings {
     pub fn get_string(&self, key: &str) -> Option<String> {
         self.0.borrow().get(key).map(|a| a.to_string())
     }
+
+    pub(crate) fn type_search_depth(&self) -> Result<usize, String> {
+        match self.get_string("max-type-depth") {
+            None => Ok(super::types::DEFAULT_TYPE_SEARCH_DEPTH),
+            Some(value) => value.parse::<usize>()
+                .map_err(|_| format!("max-type-depth expects a non-negative integer, got {value}")),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -465,6 +473,7 @@ impl Metta {
     }
 
     pub fn evaluate_atom(&self, atom: Atom) -> Result<Vec<Atom>, String> {
+        let _type_search_scope = super::types::scoped_type_search_depth(self.settings().type_search_depth()?);
         let atom = if is_bare_minimal_interpreter(self) {
             atom
         } else {
@@ -742,17 +751,26 @@ impl<'input> RunContext<'_, 'input> {
             init_state: self.init_state,
         };
 
+        //TODO-HACK: The same hack as in RunnerState::run_in_context. The operations which are executed
+        // inline access the context through the runner. Without pushing the new context they would
+        // lock the context of the caller, which is locked already while the caller waits for us
+        let metta = new_context.metta;
+        metta.0.context.lock().unwrap().push(Arc::new(Mutex::new( unsafe{ std::mem::transmute(&mut new_context) } )));
+
         let mut err = None;
         match f(&mut new_context) {
             Ok(_) => {
                 while new_context.i_wrapper.mode != MettaRunnerMode::TERMINATE {
-                    if new_context.step().is_err() {
+                    if let Err(e) = new_context.step() {
+                        err = Some(e);
                         break;
                     }
                 }
             },
             Err(e) => err = Some(e)
         }
+
+        metta.0.context.lock().unwrap().pop();
 
         match err {
             None => Ok(new_interpreter.results),
@@ -808,6 +826,10 @@ impl<'input> RunContext<'_, 'input> {
     /// A version of [Metta::load_module_at_path] Useful for loading sub-modules 
     #[cfg(feature = "pkg_mgmt")]
     pub fn load_module_at_path<P: AsRef<std::path::Path>>(&mut self, path: P, mod_name: Option<&str>) -> Result<ModId, String> {
+
+        if path.as_ref().to_str().map_or(false, |path| path.contains('\0')) {
+            return Err("Module path contains a NUL byte".into());
+        }
 
         let absolute_mod_name = match mod_name {
             Some(mod_name) => {
@@ -964,7 +986,7 @@ impl<'input> RunContext<'_, 'input> {
                 self.load_module_alias(mod_name, mod_id)
             },
             None => {
-                let new_id = self.init_module(mod_name, loader)?;
+                let new_id = self.init_module_with_descriptor(mod_name, Some(descriptor.clone()), loader)?;
                 self.init_state.add_module_descriptor(&self.metta, descriptor, new_id);
                 Ok(new_id)
             }
@@ -975,7 +997,11 @@ impl<'input> RunContext<'_, 'input> {
     ///
     /// The init function will then call `context.init_self_module()` along with any other initialization code
     fn init_module(&mut self, mod_name: &str, loader: Box<dyn ModuleLoader>) -> Result<ModId, String> {
-        let new_mod_id = self.init_state.init_module(&self.metta, mod_name, loader)?;
+        self.init_module_with_descriptor(mod_name, None, loader)
+    }
+
+    fn init_module_with_descriptor(&mut self, mod_name: &str, descriptor: Option<ModuleDescriptor>, loader: Box<dyn ModuleLoader>) -> Result<ModId, String> {
+        let new_mod_id = self.init_state.init_module(&self.metta, mod_name, descriptor, loader)?;
 
         if self.init_state.is_root() {
             let mut init_state = ModuleInitState::empty();
@@ -1027,6 +1053,7 @@ impl<'input> RunContext<'_, 'input> {
 
     /// Private method to advance the context forward one step
     fn step(&mut self) -> Result<(), String> {
+        let _type_search_scope = super::types::scoped_type_search_depth(self.metta.settings().type_search_depth()?);
 
         // If we're in the middle of interpreting an atom...
         if let Some(interpreter_state) = core::mem::take(&mut self.i_wrapper.interpreter_state) {

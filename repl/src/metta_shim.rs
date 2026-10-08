@@ -119,9 +119,11 @@ pub mod metta_interface_mod {
             }
         }
 
-        pub fn exec<R: Iterator<Item=std::io::Result<char>>, I: Into<CharReader<R>>>(&mut self, input: I) {
+        pub fn exec<R: Iterator<Item=std::io::Result<char>>, I: Into<CharReader<R>>>(&mut self, input: I) -> Result<(), String> {
+            self.result.clear();
             // TODO: should be replaced by wrapping Rust CharReader into Python API
-            let line: String = input.into().map(|r| r.expect("Error while reading input")).collect();
+            let line = input.into().collect::<std::io::Result<String>>()
+                .map_err(|error| format!("Error while reading input: {error}"))?;
 
             //Initialize the runner state
             let runner_state = Python::with_gil(|py| -> PyResult<Py<PyAny>> {
@@ -132,7 +134,7 @@ pub mod metta_interface_mod {
                 let args = PyTuple::new(py, &[py_metta, line]);
                 let result = runner_class.call1(args)?;
                 Ok(result.into())
-            }).unwrap();
+            }).map_err(|error| error.to_string())?;
 
             exec_state_prepare();
 
@@ -143,8 +145,8 @@ pub mod metta_interface_mod {
                     let func = module.getattr("run_is_complete")?;
                     let args = PyTuple::new(py, &[&runner_state]);
                     let result = func.call1(args)?;
-                    Ok(result.downcast::<PyBool>().unwrap().is_true())
-                }).unwrap() {
+                    Ok(result.downcast::<PyBool>()?.is_true())
+                }).map_err(|error| error.to_string())? {
                     break;
                 }
 
@@ -159,15 +161,16 @@ pub mod metta_interface_mod {
                     let func = module.getattr("run_step")?;
                     let args = PyTuple::new(py, &[&runner_state]);
                     let result = func.call1(args)?;
-                    let results_list = result.downcast::<PyList>().unwrap();
+                    let results_list = result.downcast::<PyList>()?;
                     let mut results: Vec<Vec<Py<PyAny>>> = vec![];
                     for result in results_list {
-                        let inner_list = result.downcast::<PyList>().unwrap();
+                        let inner_list = result.downcast::<PyList>()?;
                         results.push(inner_list.iter().map(|atom| atom.into()).collect());
                     }
                     Ok(results)
-                }).unwrap();
+                }).map_err(|error| error.to_string())?;
             }
+            Ok(())
         }
 
         pub fn print_result(&self) {
@@ -333,7 +336,8 @@ pub mod metta_interface_mod {
             }
         }
 
-        pub fn exec<R: Iterator<Item=std::io::Result<char>>, I: Into<CharReader<R>>>(&mut self, input: I) {
+        pub fn exec<R: Iterator<Item=std::io::Result<char>>, I: Into<CharReader<R>>>(&mut self, input: I) -> Result<(), String> {
+            self.result.clear();
             let parser = SExprParser::new(input);
             let mut runner_state = RunnerState::new_with_parser(&self.metta, Box::new(parser));
 
@@ -345,9 +349,11 @@ pub mod metta_interface_mod {
                 }
 
                 //Run the next step
-                runner_state.run_step().unwrap_or_else(|err| panic!("Unhandled MeTTa error: {}", err));
+                let step_result = runner_state.run_step();
                 self.result = runner_state.current_results().clone();
+                step_result?;
             }
+            Ok(())
         }
 
         pub fn print_result(&self) {
@@ -361,7 +367,7 @@ pub mod metta_interface_mod {
         }
 
         pub fn get_config_atom(&mut self, config_name: &str) -> Option<Atom> {
-            self.exec(format!("!(get-state {config_name})").as_str());
+            self.exec(format!("!(get-state {config_name})").as_str()).ok()?;
             self.result.get(0)
                 .and_then(|vec| vec.get(0))
                 .and_then(|atom| (!atom_is_error(atom)).then_some(atom))

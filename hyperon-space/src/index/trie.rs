@@ -173,6 +173,14 @@ impl TrieKeyStorage {
         (match_mode, key, Some(atom))
     }
 
+    /// Returns keys of all hashable atoms in the storage which are equal to
+    /// the `atom`. Equal atoms can have different keys, for instance `1` and
+    /// `1.0`.
+    pub fn equal_keys<'a>(&'a self, atom: &Atom) -> impl Iterator<Item=TrieKey> + 'a {
+        self.hashable.get_equal_ids(atom)
+            .map(|hash_id| TrieKey::new(TrieKeyStore::Hash, AtomMatchMode::Equality, hash_id))
+    }
+
     /// Returns atom from storage by [TrieKey].
     pub unsafe fn get_atom_unchecked(&self, key: TrieKey) -> &Atom {
         match key.store() {
@@ -299,8 +307,17 @@ impl<D: DuplicationStrategy> AtomTrie<D> {
         }
         
         if let Some(equality_key) = key {
-            if let Some(&child_id) = self.index.get(&(node_id, equality_key)) {
-                result.extend(self.query_internal(child_id, tail.clone(), mapper))
+            match atom {
+                Some(query) if !equality_key.is_start_expr() => {
+                    for equal_key in self.keys.equal_keys(query) {
+                        if let Some(&child_id) = self.index.get(&(node_id, equal_key)) {
+                            result.extend(self.query_internal(child_id, tail.clone(), mapper))
+                        }
+                    }
+                },
+                _ => if let Some(&child_id) = self.index.get(&(node_id, equality_key)) {
+                    result.extend(self.query_internal(child_id, tail.clone(), mapper))
+                },
             }
         } else {
             // match equality nonhashable key (see TrieKeyStorage::add_atom)
@@ -392,44 +409,39 @@ impl<D: DuplicationStrategy> AtomTrie<D> {
     /// Remove specific list of [QueryKey] from the trie. Each key is matched
     /// by equality.
     #[inline]
-    pub fn remove<'a, I: Iterator<Item=QueryKey<'a>>>(&mut self, key: I) -> bool {
+    pub fn remove<'a, I: Clone + Iterator<Item=QueryKey<'a>>>(&mut self, key: I) -> bool {
         self.remove_internal(self.root, key)
     }
 
     pub fn remove_internal<'a, I>(&mut self, node_id: NodeId, mut key: I) -> bool
-        where I: Iterator<Item=QueryKey<'a>>
+        where I: Clone + Iterator<Item=QueryKey<'a>>
     {
         match key.next() {
             Some(head) => {
-                let entry = match self.keys.query_key(&head) {
-                    (_match, None, None) => None,
-                    (match_mode, Some(key), _atom) => {
-                        match self.index.get(&(node_id, key)) {
-                            Some(child_id) => {
-                                self.nodes[node_id].iter_match(match_mode)
-                                    .find(|(_i, k)| *k == key)
-                                    .map(|(i, k)| (k, i, *child_id))
-                            },
-                            None => None,
+                match self.keys.query_key(&head) {
+                    (_match, None, None) => false,
+                    (match_mode, Some(head_key), atom) => {
+                        // The atom which is written in the same way is
+                        // removed first, then the atoms which are equal to it.
+                        if self.remove_child(node_id, match_mode, head_key, key.clone()) {
+                            return true;
                         }
+                        let equal_keys: Vec<TrieKey> = match atom {
+                            Some(atom) if match_mode == AtomMatchMode::Equality
+                                && !head_key.is_start_expr() =>
+                                    self.keys.equal_keys(atom).filter(|k| *k != head_key).collect(),
+                            _ => Vec::new(),
+                        };
+                        equal_keys.into_iter()
+                            .any(|equal_key| self.remove_child(node_id, match_mode, equal_key, key.clone()))
                     },
                     (match_mode, None, Some(atom)) => {
-                        self.nodes[node_id].iter_match(match_mode)
-                            .find(|(_i, k)| atom == unsafe{ self.keys.get_atom_unchecked(*k) })
-                            .map(|(i, k)| (k, i, *self.index.get(&(node_id, k)).unwrap()))
+                        let equal_keys: Vec<TrieKey> = self.nodes[node_id].iter_match(match_mode)
+                            .filter(|(_i, k)| atom == unsafe{ self.keys.get_atom_unchecked(*k) })
+                            .map(|(_i, k)| k).collect();
+                        equal_keys.into_iter()
+                            .any(|equal_key| self.remove_child(node_id, match_mode, equal_key, key.clone()))
                     },
-                };
-                match entry {
-                    Some((child_key, index, child_id)) => {
-                        let removed = self.remove_internal(child_id, key);
-                        if removed && self.nodes[child_id].is_leaf() {
-                            self.index.remove(&(node_id, child_key));
-                            self.nodes[node_id].remove_key(child_key, index);
-                            self.keys.remove_key(child_key);
-                        }
-                        removed
-                    },
-                    None => false,
                 }
             },
             None => {
@@ -437,6 +449,29 @@ impl<D: DuplicationStrategy> AtomTrie<D> {
                 true
             },
         }
+    }
+
+    /// Removes the rest of the key from the child of the node which is
+    /// selected by the `child_key`.
+    fn remove_child<'a, I>(&mut self, node_id: NodeId, match_mode: AtomMatchMode,
+        child_key: TrieKey, key: I) -> bool
+        where I: Clone + Iterator<Item=QueryKey<'a>>
+    {
+        let child_id = match self.index.get(&(node_id, child_key)) {
+            Some(child_id) => *child_id,
+            None => return false,
+        };
+        let removed = self.remove_internal(child_id, key);
+        if removed && self.nodes[child_id].is_leaf() {
+            let index = self.nodes[node_id].iter_match(match_mode)
+                .find(|(_i, k)| *k == child_key).map(|(i, _k)| i);
+            self.index.remove(&(node_id, child_key));
+            if let Some(index) = index {
+                self.nodes[node_id].remove_key(child_key, index);
+            }
+            self.keys.remove_key(child_key);
+        }
+        removed
     }
 
     /// Return `true` if trie is empty.
@@ -542,7 +577,7 @@ impl TrieKey {
 
     #[inline]
     fn value(&self) -> usize {
-        self.0 & TK_VALUE_MASK - TK_MAX_EXPRESSION_SIZE
+        (self.0 & TK_VALUE_MASK) - TK_MAX_EXPRESSION_SIZE
     }
 
     #[inline]
@@ -926,5 +961,27 @@ mod test {
     #[test]
     fn atom_trie_trie_key_size() {
         assert_eq!(std::mem::size_of::<TrieKey>(), std::mem::size_of::<usize>());
+    }
+
+    #[test]
+    fn trie_key_roundtrips_atom_identifiers() {
+        for store in [TrieKeyStore::Hash, TrieKeyStore::Index] {
+            for mode in [AtomMatchMode::Equality, AtomMatchMode::Unification] {
+                for id in (0..4096).chain([TK_VALUE_MASK - TK_MAX_EXPRESSION_SIZE]) {
+                    let key = TrieKey::new(store, mode, id);
+                    assert_eq!(key.value(), id, "{store:?}, {mode:?}, id {id}");
+                    assert_eq!(key.store(), store);
+                    assert_eq!(key.match_mode(), mode);
+                    assert_eq!(key.as_start_expr(), None);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn trie_key_expression_markers_remain_distinct() {
+        for size in [0, 1, TK_MAX_EXPRESSION_SIZE - 1] {
+            assert_eq!(TrieKey::start_expr(size).as_start_expr(), Some(size));
+        }
     }
 }

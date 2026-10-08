@@ -96,6 +96,82 @@ START_TEST (test_runner_errors)
 }
 END_TEST
 
+START_TEST (test_nul_diagnostic_and_recovery)
+{
+    const char* source = "!(register-module! \"bad\\x00path\")";
+    metta_t runner = new_test_metta();
+    atom_vec_t* results = NULL;
+    sexpr_parser_t parser = sexpr_parser_new(source);
+    metta_run(&runner, parser, &copy_atom_vec, &results);
+    ck_assert_ptr_nonnull(results);
+    ck_assert_uint_eq(atom_vec_len(results), 1);
+    atom_ref_t error = atom_vec_get(results, 0);
+    ck_assert(atom_is_error(&error));
+    char* error_text = stratom(&error);
+    ck_assert_ptr_nonnull(strstr(error_text, "NUL byte"));
+    free(error_text);
+    atom_vec_free(*results);
+    free(results);
+    results = NULL;
+    ck_assert(run_metta_and_compare_result(&runner, "!(+ 2 3)", "5"));
+    ck_assert_ptr_null(metta_err_str(&runner));
+
+    parser = sexpr_parser_new(source);
+    runner_state_t state = runner_state_new_with_parser(&runner, parser);
+    while (!runner_state_is_complete(&state) && runner_state_err_str(&state) == NULL) {
+        runner_state_step(&state);
+    }
+    ck_assert_ptr_null(runner_state_err_str(&state));
+    runner_state_current_results(&state, &copy_atom_vec, &results);
+    ck_assert_ptr_nonnull(results);
+    ck_assert_uint_eq(atom_vec_len(results), 1);
+    error = atom_vec_get(results, 0);
+    ck_assert(atom_is_error(&error));
+    atom_vec_free(*results);
+    free(results);
+    runner_state_free(state);
+    ck_assert(run_metta_and_compare_result(&runner, "!(+ 2 3)", "5"));
+    metta_free(runner);
+}
+END_TEST
+
+START_TEST (test_unicode_numbers_and_exact_comparison)
+{
+    metta_t runner = new_test_metta();
+    ck_assert(run_metta_and_compare_result(&runner, "!(+ ٣ １２)", "15"));
+    ck_assert(run_metta_and_compare_result(&runner, "! 1٣", "13"));
+    ck_assert(run_metta_and_compare_result(&runner, "!(== 9007199254740993 9007199254740992.0)", "False"));
+    ck_assert(run_metta_and_compare_result(&runner, "!(> 9007199254740993 9007199254740992.0)", "True"));
+    metta_free(runner);
+}
+END_TEST
+
+START_TEST (test_bounded_type_search_and_positive_goal)
+{
+    metta_t runner = new_test_metta();
+    ck_assert(run_metta_and_compare_result(&runner,
+        "(: a (F x)) (:< (F $x) (F (F $x))) "
+        "(: f (-> (F (F x)) Ok)) (= (f $x) accepted) "
+        "!(pragma! max-type-depth 2)", "()"));
+    ck_assert(run_metta_and_compare_result(&runner, "!(f a)", "accepted"));
+    ck_assert(run_metta_and_compare_result(&runner, "!(get-type a)", "(Error a (TypeSearchLimit 2))"));
+    ck_assert(run_metta_and_compare_result(&runner, "(: g (-> Missing Ok)) !(g a)", "(Error a (TypeSearchLimit 2))"));
+    ck_assert(run_metta_and_compare_result(&runner, "!(+ 2 3)", "5"));
+    metta_free(runner);
+}
+END_TEST
+
+START_TEST (test_cyclic_state_display)
+{
+    metta_t runner = new_test_metta();
+    ck_assert(run_metta_and_compare_result(&runner, "!(bind! &cell (new-state (leaf)))", "()"));
+    ck_assert(run_metta_and_compare_result(&runner, "!(change-state! &cell (wrap &cell))", "(State (wrap (State <cycle>)))"));
+    ck_assert(run_metta_and_compare_result(&runner, "!(change-state! &cell (leaf))", "(State (leaf))"));
+    ck_assert(run_metta_and_compare_result(&runner, "!(get-state &cell)", "(leaf)"));
+    metta_free(runner);
+}
+END_TEST
+
 ssize_t load(void const* payload, run_context_t* run_context, write_t err) {
     space_t space = space_new_grounding_space();
     run_context_init_self_module(run_context, &space, NULL);
@@ -232,6 +308,10 @@ void init_test(TCase* test_case) {
     tcase_add_checked_fixture(test_case, setup, teardown);
     tcase_add_test(test_case, test_incremental_runner);
     tcase_add_test(test_case, test_runner_errors);
+    tcase_add_test(test_case, test_nul_diagnostic_and_recovery);
+    tcase_add_test(test_case, test_unicode_numbers_and_exact_comparison);
+    tcase_add_test(test_case, test_bounded_type_search_and_positive_goal);
+    tcase_add_test(test_case, test_cyclic_state_display);
     tcase_add_test(test_case, test_custom_module_format);
     tcase_add_test(test_case, test_custom_stdlib);
 }

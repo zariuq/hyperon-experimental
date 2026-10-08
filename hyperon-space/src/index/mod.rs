@@ -257,6 +257,43 @@ mod test {
 
 
     #[test]
+    fn atom_index_iter_enumerates_all_atoms_above_key_id_threshold() {
+        // Regression for the enumeration surface of the TrieKey::value()
+        // precedence defect (issue #1079): with more than
+        // TK_MAX_EXPRESSION_SIZE distinct stored keys, enumeration used to
+        // fail on the first key with storage id >= 1024. The local
+        // unpatched build panics here; a tolerant path producing a silent
+        // undercount has not been identified. Insert 1500 same-head atoms
+        // and require complete enumeration.
+        let mut index: AtomIndex = Default::default();
+        let n = 1500usize;
+        for i in 0..n {
+            index.insert(Atom::expr([Atom::sym("F"),
+                Atom::sym(format!("a{}", i))]));
+        }
+        assert_eq!(index.iter().count(), n);
+    }
+
+    #[test]
+    fn atom_index_survives_key_ids_above_max_expression_size() {
+        // Regression for the TrieKey::value() precedence defect: with more
+        // than TK_MAX_EXPRESSION_SIZE (1024) distinct keys in storage, the
+        // first unification query used to decode key ids incorrectly and
+        // panic (or read out of bounds). Insert well past the boundary and
+        // query everything back.
+        let mut index: AtomIndex = Default::default();
+        let n = 3000usize;
+        for i in 0..n {
+            index.insert(Atom::expr([Atom::sym("Flat"),
+                Atom::sym(format!("a{}", i)), Atom::sym(format!("b{}", i))]));
+        }
+        let results: Vec<_> = index
+            .query(&Atom::expr([Atom::sym("Flat"), Atom::var("x"), Atom::var("y")]))
+            .collect();
+        assert_eq!(results.len(), n);
+    }
+
+    #[test]
     fn atom_token_iter_symbol() {
         let atom = Atom::sym("sym");
         let it = AtomIter::from_ref(&atom);
@@ -643,6 +680,68 @@ mod test {
         fn as_match(&self) -> Option<&dyn CustomMatch> {
             Some(self)
         }
+    }
+
+    fn int(v: i64) -> Atom {
+        Atom::gnd(hyperon_atom::gnd::number::Number::Integer(v))
+    }
+
+    fn float(v: f64) -> Atom {
+        Atom::gnd(hyperon_atom::gnd::number::Number::Float(v))
+    }
+
+    fn atoms<D: DuplicationStrategy>(index: &AtomIndex<D>) -> Vec<String> {
+        let mut atoms: Vec<String> = index.iter().map(|atom| atom.to_string()).collect();
+        atoms.sort();
+        atoms
+    }
+
+    #[test]
+    fn atom_index_query_finds_all_equal_numbers() {
+        let mut index = AtomIndex::with_strategy(ALLOW_DUPLICATION);
+        index.insert(Atom::expr([sym!("row"), int(1)]));
+        index.insert(Atom::expr([sym!("row"), float(1.0)]));
+        index.insert(Atom::expr([sym!("row"), float(1.5)]));
+
+        // each atom is returned as it was inserted
+        assert_eq!(atoms(&index), vec!["(row 1)", "(row 1.0)", "(row 1.5)"]);
+        // both equal numbers are found by each of them, like `==` has it
+        assert_eq!(index.query(&Atom::expr([sym!("row"), int(1)])).count(), 2);
+        assert_eq!(index.query(&Atom::expr([sym!("row"), float(1.0)])).count(), 2);
+        assert_eq!(index.query(&Atom::expr([sym!("row"), float(1.5)])).count(), 1);
+        assert_eq!(index.query(&Atom::expr([sym!("row"), int(2)])).count(), 0);
+    }
+
+    #[test]
+    fn atom_index_query_equal_numbers_does_not_depend_on_insertion_order() {
+        for numbers in [[int(0), float(0.0), float(-0.0)], [float(-0.0), int(0), float(0.0)],
+                [float(0.0), float(-0.0), int(0)]] {
+            let mut index = AtomIndex::with_strategy(ALLOW_DUPLICATION);
+            for number in numbers {
+                index.insert(number);
+            }
+            assert_eq!(atoms(&index), vec!["-0.0", "0", "0.0"]);
+            for query in [int(0), float(0.0), float(-0.0)] {
+                assert_eq!(index.query(&query).count(), 3);
+            }
+        }
+    }
+
+    #[test]
+    fn atom_index_remove_prefers_the_number_written_in_the_same_way() {
+        let mut index = AtomIndex::with_strategy(ALLOW_DUPLICATION);
+        index.insert(Atom::expr([int(1), sym!("a")]));
+        index.insert(Atom::expr([float(1.0), sym!("a")]));
+        index.insert(Atom::expr([float(1.0), sym!("b")]));
+
+        assert!(index.remove(&Atom::expr([float(1.0), sym!("a")])));
+        assert_eq!(atoms(&index), vec!["(1 a)", "(1.0 b)"]);
+        // no atom is written in the same way, the equal one is removed
+        assert!(index.remove(&Atom::expr([int(1), sym!("b")])));
+        assert_eq!(atoms(&index), vec!["(1 a)"]);
+        assert!(!index.remove(&Atom::expr([float(1.0), sym!("b")])));
+        assert!(index.remove(&Atom::expr([float(1.0), sym!("a")])));
+        assert!(index.is_empty());
     }
 
     #[test]

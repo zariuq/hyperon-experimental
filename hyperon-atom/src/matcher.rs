@@ -330,9 +330,9 @@ impl Bindings {
         match (&a_binding.atom, &b_binding.atom) {
             (Some(a_atom), Some(b_atom)) => {
                 if a_atom == b_atom {
-                    let a_binding = a_binding.id;
-                    let b_binding = self.bindings.remove(b_binding.id);
-                    self.add_var_to_binding(a_binding, b_binding.var);
+                    let a_binding_id = a_binding.id;
+                    let b_binding_id = b_binding.id;
+                    self.move_binding_to_binding(b_binding_id, a_binding_id);
                     BindingsSet::from(self)
                 } else {
                     self.match_values(&a_atom, &b_atom)
@@ -1663,6 +1663,31 @@ mod test {
         let bindings = bindings.add_var_binding(b.clone(), Atom::expr([Atom::sym("S"), Atom::Variable(a.clone())]))?;
         let bindings = bindings.add_var_equality(&a, &b);
         assert_eq!(bindings, Ok(bind!{ b: expr!("S" a),  a: expr!(b) }));
+        Ok(())
+    }
+
+    #[test]
+    fn bindings_add_var_equality_keeps_all_vars_when_equal_value_classes_merge(
+    ) -> Result<(), &'static str> {
+        let x = VariableAtom::new("x");
+        let y = VariableAtom::new("y");
+        let a = VariableAtom::new("a");
+        let b = VariableAtom::new("b");
+        let bindings = Bindings::new()
+            .add_var_equality(&x, &y)?
+            .add_var_equality(&a, &b)?
+            .add_var_binding(&x, expr!("Z"))?
+            .add_var_binding(&a, expr!("Z"))?
+            .add_var_equality(&x, &a)?;
+
+        assert_eq!(bindings.resolve(&x), Some(expr!("Z")));
+        assert_eq!(bindings.resolve(&y), Some(expr!("Z")));
+        assert_eq!(bindings.resolve(&a), Some(expr!("Z")));
+        assert_eq!(bindings.resolve(&b), Some(expr!("Z")));
+        assert_eq!(
+            Bindings::new().merge(&bindings),
+            BindingsSet::from(bind! { x: expr!("Z"), y: expr!("Z"), a: expr!("Z"), b: expr!("Z") })
+        );
         Ok(())
     }
 

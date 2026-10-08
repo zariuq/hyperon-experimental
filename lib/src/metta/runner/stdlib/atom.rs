@@ -4,10 +4,10 @@ use crate::metta::*;
 use crate::metta::text::Tokenizer;
 use crate::metta::types::{AtomType, get_atom_types, get_meta_type};
 use hyperon_atom::matcher::atoms_are_equivalent;
-use hyperon_common::multitrie::{MultiTrie, TrieKey, TrieToken};
 use super::{grounded_op, regex};
 use hyperon_atom::gnd::number::*;
 
+use std::collections::HashMap;
 use std::convert::TryInto;
 use std::hash::{DefaultHasher, Hasher};
 
@@ -85,32 +85,71 @@ impl Grounded for IntersectionAtomOp {
     }
 }
 
-fn atom_to_trie_key(atom: &Atom) -> TrieKey<SymbolAtom> {
-    fn fill_key(atom: &Atom, tokens: &mut Vec<TrieToken<SymbolAtom>>) {
+/// Hashes an atom in a way which agrees with the equality of atoms: equal atoms
+/// have equal hashes. Numbers are hashed by value because an integer is equal to
+/// the float of the same value. Other grounded atoms do not contribute to the
+/// hash, because their equality is not required to agree with their serialization.
+fn atom_equality_hash(atom: &Atom) -> u64 {
+    fn feed(atom: &Atom, hasher: &mut DefaultHasher) {
         match atom {
-            Atom::Symbol(sym) => tokens.push(TrieToken::Exact(sym.clone())),
-            Atom::Expression(expr) => {
-                tokens.push(TrieToken::LeftPar);
-                expr.children().iter().for_each(|child| fill_key(child, tokens));
-                tokens.push(TrieToken::RightPar);
+            Atom::Symbol(sym) => {
+                hasher.write_u8(b'S');
+                hasher.write(sym.name().as_bytes());
+                hasher.write_u8(0);
             },
-            Atom::Grounded(g) if g.as_grounded().as_match().is_none() => {
-                // TODO: Adding Hash on grounded atoms matched by equality is
-                // required in order to make TrieToken::Exact be generated for
-                // them.
-                let mut h = DefaultHasher::new();
-                match (*g).serialize(&mut h) {
-                    Ok(()) => { tokens.push(TrieToken::Exact(SymbolAtom::new(h.finish().to_string().into()))) }
-                    Err(_) => { tokens.push(TrieToken::Wildcard) }
-                }
-            }
-            _ => tokens.push(TrieToken::Wildcard),
+            Atom::Variable(var) => {
+                hasher.write_u8(b'V');
+                hasher.write(var.name().as_bytes());
+                hasher.write_u8(0);
+            },
+            Atom::Expression(expr) => {
+                hasher.write_u8(b'(');
+                expr.children().iter().for_each(|child| feed(child, hasher));
+                hasher.write_u8(b')');
+            },
+            Atom::Grounded(_) => match Number::from_atom(atom) {
+                Some(number) => {
+                    let value: f64 = number.into();
+                    hasher.write_u8(b'N');
+                    // 0.0 is equal to -0.0
+                    hasher.write_u64(if value == 0.0 { 0 } else { value.to_bits() });
+                },
+                None => hasher.write_u8(b'G'),
+            },
         }
     }
 
-    let mut tokens = Vec::new();
-    fill_key(atom, &mut tokens);
-    TrieKey::from(tokens)
+    let mut hasher = DefaultHasher::new();
+    feed(atom, &mut hasher);
+    hasher.finish()
+}
+
+/// A multiset of atoms which gives away each of its atoms at most once. Atoms
+/// are compared by equality, the hash only narrows the search.
+struct AtomMultiset<'a> {
+    buckets: HashMap<u64, Vec<&'a Atom>>,
+}
+
+impl<'a> AtomMultiset<'a> {
+    fn new(atoms: &'a [Atom]) -> Self {
+        let mut buckets: HashMap<u64, Vec<&'a Atom>> = HashMap::new();
+        for atom in atoms {
+            buckets.entry(atom_equality_hash(atom)).or_default().push(atom);
+        }
+        Self{ buckets }
+    }
+
+    /// Removes one atom which is equal to `atom` from the multiset. Returns
+    /// `false` when there is no such atom left.
+    fn take(&mut self, atom: &Atom) -> bool {
+        match self.buckets.get_mut(&atom_equality_hash(atom)) {
+            Some(bucket) => match bucket.iter().rposition(|item| *item == atom) {
+                Some(position) => { bucket.swap_remove(position); true },
+                None => false,
+            },
+            None => false,
+        }
+    }
 }
 
 
@@ -120,46 +159,8 @@ impl CustomExecute for IntersectionAtomOp {
         let mut lhs: Vec<Atom> = TryInto::<&ExpressionAtom>::try_into(args.get(0).ok_or_else(arg_error)?)?.children().into();
         let rhs = TryInto::<&ExpressionAtom>::try_into(args.get(1).ok_or_else(arg_error)?)?.children();
 
-        let mut rhs_index: MultiTrie<SymbolAtom, Vec<usize>> = MultiTrie::new();
-        for (index, rhs_item) in rhs.iter().enumerate() {
-            let k = atom_to_trie_key(&rhs_item);
-            // FIXME this should
-            // a) use a mutable value endpoint which the MultiTrie does not support atm
-            // b) use a linked list, which Rust barely supports atm
-            let r = rhs_index.get(&k).next();
-            match r.cloned() {
-                Some(bucket) => {
-                    rhs_index.remove(&k, &bucket);
-                    let mut nbucket = bucket;
-                    nbucket.push(index);
-                    let nbucket = nbucket;
-                    rhs_index.insert(k, nbucket);
-                }
-                None => { rhs_index.insert(k, vec![index]) }
-            }
-        }
-
-        lhs.retain(|candidate| {
-            let k = atom_to_trie_key(candidate);
-            let r = rhs_index.get(&k).next();
-            match r.cloned() {
-                None => { false }
-                Some(bucket) => {
-                    match bucket.iter().position(|item| &rhs[*item] == candidate) {
-                        None => { false }
-                        Some(i) => {
-                            rhs_index.remove(&k, &bucket);
-                            if bucket.len() > 1 {
-                                let mut nbucket = bucket;
-                                nbucket.remove(i);
-                                rhs_index.insert(k, nbucket);
-                            }
-                            true
-                        }
-                    }
-                }
-            }
-        });
+        let mut rhs = AtomMultiset::new(rhs);
+        lhs.retain(|candidate| rhs.take(candidate));
 
         Ok(vec![Atom::expr(lhs)])
     }
@@ -305,46 +306,8 @@ impl CustomExecute for SubtractionAtomOp {
         let mut lhs: Vec<Atom> = TryInto::<&ExpressionAtom>::try_into(args.get(0).ok_or_else(arg_error)?)?.children().into();
         let rhs = TryInto::<&ExpressionAtom>::try_into(args.get(1).ok_or_else(arg_error)?)?.children();
 
-        let mut rhs_index: MultiTrie<SymbolAtom, Vec<usize>> = MultiTrie::new();
-        for (index, rhs_item) in rhs.iter().enumerate() {
-            let k = atom_to_trie_key(&rhs_item);
-            // FIXME this should
-            // a) use a mutable value endpoint which the MultiTrie does not support atm
-            // b) use a linked list, which Rust barely supports atm
-            let r = rhs_index.get(&k).next();
-            match r.cloned() {
-                Some(bucket) => {
-                    rhs_index.remove(&k, &bucket);
-                    let mut nbucket = bucket;
-                    nbucket.push(index);
-                    let nbucket = nbucket;
-                    rhs_index.insert(k, nbucket);
-                }
-                None => { rhs_index.insert(k, vec![index]) }
-            }
-        }
-
-        lhs.retain(|candidate| {
-            let k = atom_to_trie_key(candidate);
-            let r = rhs_index.get(&k).next();
-            match r.cloned() {
-                None => { true }
-                Some(bucket) => {
-                    match bucket.iter().position(|item| &rhs[*item] == candidate) {
-                        None => { true }
-                        Some(i) => {
-                            rhs_index.remove(&k, &bucket);
-                            if bucket.len() > 1 {
-                                let mut nbucket = bucket;
-                                nbucket.remove(i);
-                                rhs_index.insert(k, nbucket);
-                            }
-                            false
-                        }
-                    }
-                }
-            }
-        });
+        let mut rhs = AtomMultiset::new(rhs);
+        lhs.retain(|candidate| !rhs.take(candidate));
 
         Ok(vec![Atom::expr(lhs)])
     }
@@ -383,7 +346,9 @@ impl CustomExecute for GetTypeOp {
             None => Ok(&self.space),
         }?;
         let types = get_atom_types(space, atom);
-        if types.iter().all(AtomType::is_error) {
+        if types.iter().any(AtomType::is_search_limit) {
+            Ok(types.into_iter().filter(AtomType::is_search_limit).map(AtomType::into_error_unchecked).collect())
+        } else if types.iter().all(AtomType::is_error) {
             Ok(vec![EMPTY_SYMBOL])
         } else {
             Ok(types.into_iter().filter(AtomType::is_valid).map(AtomType::into_atom).collect())
@@ -438,7 +403,9 @@ impl CustomExecute for GetTypeSpaceOp {
         let atom = args.get(1).ok_or_else(arg_error)?;
         log::debug!("GetTypeSpaceOp::execute: space: {}, atom: {}", space, atom);
         let types = get_atom_types(space, atom);
-        if types.iter().all(AtomType::is_error) {
+        if types.iter().any(AtomType::is_search_limit) {
+            Ok(types.into_iter().filter(AtomType::is_search_limit).map(AtomType::into_error_unchecked).collect())
+        } else if types.iter().all(AtomType::is_error) {
             Ok(vec![EMPTY_SYMBOL])
         } else {
             Ok(types.into_iter().filter(AtomType::is_valid).map(AtomType::into_atom).collect())
@@ -480,6 +447,7 @@ mod tests {
     use crate::metta::text::SExprParser;
     use crate::metta::runner::EnvBuilder;
     use hyperon_atom::gnd::str::Str;
+    use hyperon_atom::gnd::bool::Bool;
     use crate::space::grounding::metta_space;
     use crate::metta::runner::run_program;
     use crate::metta::runner::Metta;
@@ -674,16 +642,24 @@ mod tests {
     }
 
     #[test]
-    fn index_atom_to_key() {
-        assert_eq!(atom_to_trie_key(&Atom::sym("A")), TrieKey::from([TrieToken::Exact(SymbolAtom::new("A".into()))]));
-        assert_eq!(atom_to_trie_key(&Atom::value(1)), TrieKey::from([TrieToken::Wildcard]));
-        assert_eq!(atom_to_trie_key(&Atom::var("a")), TrieKey::from([TrieToken::Wildcard]));
-        assert_eq!(atom_to_trie_key(&expr!("A" "B")), TrieKey::from([
-                TrieToken::LeftPar,
-                TrieToken::Exact(SymbolAtom::new("A".into())),
-                TrieToken::Exact(SymbolAtom::new("B".into())),
-                TrieToken::RightPar
-        ]));
+    fn equal_atoms_have_equal_hashes() {
+        let equal = [
+            (Atom::sym("A"), Atom::sym("A")),
+            (Atom::var("a"), Atom::var("a")),
+            (expr!("A" ("B" x)), expr!("A" ("B" x))),
+            (Atom::gnd(Number::Integer(1)), Atom::gnd(Number::Float(1.0))),
+            (Atom::gnd(Number::Float(0.0)), Atom::gnd(Number::Float(-0.0))),
+            (Atom::value(1), Atom::value(1)),
+        ];
+        for (a, b) in equal {
+            assert_eq!(a, b);
+            assert_eq!(atom_equality_hash(&a), atom_equality_hash(&b));
+        }
+
+        assert_ne!(atom_equality_hash(&Atom::sym("A")), atom_equality_hash(&Atom::sym("B")));
+        assert_ne!(atom_equality_hash(&Atom::sym("A")), atom_equality_hash(&Atom::var("A")));
+        assert_ne!(atom_equality_hash(&expr!("A" "B")), atom_equality_hash(&expr!(("A") "B")));
+        assert_ne!(atom_equality_hash(&Atom::gnd(Number::Integer(1))), atom_equality_hash(&Atom::gnd(Number::Integer(2))));
     }
 
     #[test]
@@ -745,6 +721,55 @@ mod tests {
             )]).unwrap();
         assert_eq_no_order!(actual,
                    vec![expr!(("A" ("B" "C")) ("f" "g") ("f" "g") ("P" "b"))]);
+    }
+
+    #[test]
+    fn intersection_and_subtraction_with_variables() {
+        // Every variable used to share one wildcard key of the index, so the results
+        // lost members and differed from run to run
+        let lhs = expr!("A" x "B" y "C");
+        let rhs = expr!(y "C" "A" x "B");
+        for _ in 0..16 {
+            assert_eq!(IntersectionAtomOp{}.execute(&mut vec![lhs.clone(), rhs.clone()]).unwrap(),
+                vec![expr!("A" x "B" y "C")]);
+            assert_eq!(SubtractionAtomOp{}.execute(&mut vec![lhs.clone(), rhs.clone()]).unwrap(),
+                vec![expr!()]);
+        }
+
+        // Variables are compared by name
+        assert_eq!(IntersectionAtomOp{}.execute(&mut vec![expr!(x y ("f" x)), expr!(("f" x) z x)]).unwrap(),
+            vec![expr!(x ("f" x))]);
+        assert_eq!(SubtractionAtomOp{}.execute(&mut vec![expr!(x y ("f" x)), expr!(("f" x) z x)]).unwrap(),
+            vec![Atom::expr([Atom::var("y")])]);
+    }
+
+    #[test]
+    fn intersection_and_subtraction_are_multiset_operations() {
+        let lhs = expr!("a" "a" "a" "b" {Number::Integer(1)} {Number::Integer(1)});
+        let rhs = expr!("a" {Number::Integer(1)} "a" "c");
+        assert_eq!(IntersectionAtomOp{}.execute(&mut vec![lhs.clone(), rhs.clone()]).unwrap(),
+            vec![expr!("a" "a" {Number::Integer(1)})]);
+        assert_eq!(SubtractionAtomOp{}.execute(&mut vec![lhs, rhs]).unwrap(),
+            vec![expr!("a" "b" {Number::Integer(1)})]);
+    }
+
+    #[test]
+    fn intersection_and_subtraction_compare_atoms_by_equality() {
+        // An integer is equal to the float of the same value, like in `==` and `unique-atom`
+        let lhs = expr!({Number::Integer(1)} {Number::Integer(2)} {Number::Float(0.0)});
+        let rhs = expr!({Number::Float(1.0)} {Number::Float(-0.0)} {Number::Integer(3)});
+        assert_eq!(IntersectionAtomOp{}.execute(&mut vec![lhs.clone(), rhs.clone()]).unwrap(),
+            vec![expr!({Number::Integer(1)} {Number::Float(0.0)})]);
+        assert_eq!(SubtractionAtomOp{}.execute(&mut vec![lhs, rhs]).unwrap(),
+            vec![Atom::expr([Atom::gnd(Number::Integer(2))])]);
+
+        // Grounded atoms other than numbers are found as well
+        let lhs = expr!({Bool(true)} {Bool(false)} {Bool(true)});
+        let rhs = Atom::expr([Atom::gnd(Bool(true))]);
+        assert_eq!(IntersectionAtomOp{}.execute(&mut vec![lhs.clone(), rhs.clone()]).unwrap(),
+            vec![Atom::expr([Atom::gnd(Bool(true))])]);
+        assert_eq!(SubtractionAtomOp{}.execute(&mut vec![lhs, rhs]).unwrap(),
+            vec![expr!({Bool(false)} {Bool(true)})]);
     }
 
     #[test]

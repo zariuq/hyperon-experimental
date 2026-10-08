@@ -79,7 +79,10 @@ impl CustomExecute for AbsMathOp {
         let arg_error = || ExecError::from("abs-math expects one argument: number");
         let input = args.get(0).and_then(Number::from_atom).ok_or_else(arg_error)?;
         match input {
-            Number::Integer(n) => Ok(vec![Atom::gnd(Number::Integer(n.abs()))]),
+            // The absolute value of the smallest integer doesn't fit into the integer type
+            Number::Integer(n) => n.checked_abs()
+                .map(|res| vec![Atom::gnd(Number::Integer(res))])
+                .ok_or_else(|| ExecError::from("IntegerOverflow")),
             Number::Float(f) => Ok(vec![Atom::gnd(Number::Float(f.abs()))])
         }
     }

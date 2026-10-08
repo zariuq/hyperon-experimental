@@ -740,7 +740,16 @@ impl ModuleDescriptor {
     /// The purpose of the `fmt_id` is to ensure two different formats or catalogs don't generate
     /// the same ModuleDescriptor, but you can pass 0 if it doesn't matter
     pub fn new_with_path_and_fmt_id(name: String, version: Option<semver::Version>, path: &Path, fmt_id: u64) -> Self {
-        Self::new_with_ident_bytes_and_fmt_id(name, version, path.as_os_str().as_encoded_bytes(), fmt_id)
+        let source_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        Self::new_with_ident_bytes_and_fmt_id(name, version, source_path.as_os_str().as_encoded_bytes(), fmt_id)
+    }
+
+    /// Detect an unfinished load of the same source even when it has a different alias.
+    pub(crate) fn same_source(&self, other: &Self) -> bool {
+        match (self.uid, other.uid) {
+            (Some(a), Some(b)) => a == b && self.version == other.version,
+            _ => self == other,
+        }
     }
     /// Returns the name of the module represented by the ModuleDescriptor
     pub fn name(&self) -> &str {

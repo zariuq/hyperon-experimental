@@ -1,4 +1,5 @@
 import unittest
+import tempfile
 
 from hyperon import Environment
 
@@ -8,7 +9,7 @@ class HyperonTestCase(unittest.TestCase):
         super().__init__(methodName)
 
     def testEnvironment(self):
-        self.assertTrue(Environment.init_common_env(config_dir = "/tmp/hyperon-test", create_config = True))
-        self.assertEqual(Environment.config_dir(), "/tmp/hyperon-test")
-
-        self.assertFalse(Environment.init_common_env())
+        with tempfile.TemporaryDirectory(prefix="hyperon-environment-test-") as config_dir:
+            self.assertTrue(Environment.init_common_env(config_dir=config_dir, create_config=True))
+            self.assertEqual(Environment.config_dir(), config_dir)
+            self.assertFalse(Environment.init_common_env())

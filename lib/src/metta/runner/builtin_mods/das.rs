@@ -15,7 +15,7 @@ use metta_bus_client::{host_id_from_atom, service_bus_singleton::ServiceBusSingl
 use metta_bus_client::{properties::PropertyValue, space::DistributedAtomSpace};
 
 use crate::metta::gnd::str::ATOM_TYPE_STRING;
-use crate::metta::runner::stdlib::{grounded_op, regex};
+use crate::metta::runner::stdlib::regex;
 use crate::metta::runner::{Metta, RunContext, SExprParser};
 use crate::metta::{
     runner::{

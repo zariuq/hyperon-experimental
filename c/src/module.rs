@@ -135,8 +135,12 @@ impl std::fmt::Debug for CModuleLoader {
 impl ModuleLoader for CModuleLoader {
     fn load(&self, context: &mut RunContext) -> Result<(), String> {
         let mut err = String::new();
-        let rc = (self.reference().load.unwrap())(self.payload(), &mut context.into(), (&mut CWrite::new(&mut err)).into());
-        self.result(rc, err)
+        let mut c_context = context.into();
+        let rc = (self.reference().load.unwrap())(self.payload(), &mut c_context, (&mut CWrite::new(&mut err)).into());
+        match c_context.take_err_string() {
+            Some(error) => Err(error),
+            None => self.result(rc, err),
+        }
     }
 
     fn load_tokens(&self, target: &MettaMod, metta: Metta) -> Result<(), String> {
@@ -349,8 +353,12 @@ unsafe impl Sync for CFsModuleFormat {}
 
 impl FsModuleFormat for CFsModuleFormat {
     fn paths_for_name(&self, parent_dir: &Path, mod_name: &str) -> Vec<PathBuf> {
-        let parent_dir_c_string = str_as_cstr(parent_dir.to_str().unwrap());
-        let mod_name_c_string = str_as_cstr(mod_name);
+        let Some(parent_dir_c_string) = parent_dir.to_str().and_then(|path| std::ffi::CString::new(path).ok()) else {
+            return vec![];
+        };
+        let Ok(mod_name_c_string) = std::ffi::CString::new(mod_name) else {
+            return vec![];
+        };
         const BUF_SIZE: usize = 512;
         let mut buffer = [0 as c_char; BUF_SIZE];
 
@@ -361,19 +369,19 @@ impl FsModuleFormat for CFsModuleFormat {
             buffer.as_mut_ptr(),
             BUF_SIZE
         );
-        if bytes_written > 0 {
-            vec![PathBuf::from(cstr_as_str(buffer[0..=bytes_written].as_ptr()))]
+        if bytes_written > 0 && bytes_written <= BUF_SIZE && buffer[..bytes_written].contains(&0) {
+            vec![PathBuf::from(cstr_as_str(buffer.as_ptr()))]
         } else {
             vec![]
         }
     }
     fn try_path(&self, path: &Path, mod_name: Option<&str>) -> Option<(Box<dyn ModuleLoader>, ModuleDescriptor)> {
-        let path_c_string = str_as_cstr(path.to_str().unwrap());
+        let path_c_string = std::ffi::CString::new(path.to_str()?).ok()?;
         let mod_name = match mod_name {
             Some(mod_name) => mod_name,
-            None => path.file_stem().unwrap().to_str().unwrap()
+            None => path.file_stem()?.to_str()?
         };
-        let mod_name_c_string = str_as_cstr(mod_name);
+        let mod_name_c_string = std::ffi::CString::new(mod_name).ok()?;
 
         let mut mod_loader: *const module_loader_t = std::ptr::null(); 
         let mut mod_descriptor: module_descriptor_t = Default::default();
@@ -388,3 +396,48 @@ impl FsModuleFormat for CFsModuleFormat {
     }
 }
 
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+    use crate::space::{space_new_grounding_space, space_free};
+
+    extern "C" fn full_path(_: *const c_void, _: *const c_char, _: *const c_char, output: *mut c_char, size: usize) -> usize {
+        let buffer = unsafe { std::slice::from_raw_parts_mut(output, size) };
+        buffer.fill(b'a' as c_char);
+        buffer[size - 1] = 0;
+        size
+    }
+
+    extern "C" fn oversize_path(_: *const c_void, _: *const c_char, _: *const c_char, _: *mut c_char, size: usize) -> usize { size + 1 }
+
+    extern "C" fn no_module(_: *const c_void, _: *const c_char, _: *const c_char, _: *mut *const module_loader_t, _: *mut module_descriptor_t) -> bool { false }
+
+    #[test]
+    fn full_capacity_path_and_bad_size_are_handled_without_panics() {
+        let api = fs_module_format_t { path_for_name: full_path, try_path: no_module, free: None };
+        let format = CFsModuleFormat::new(&api);
+        assert_eq!(format.paths_for_name(Path::new("."), "name")[0], PathBuf::from("a".repeat(511)));
+        assert!(format.paths_for_name(Path::new("."), "bad\0name").is_empty());
+        assert!(format.try_path(Path::new("bad\0path"), None).is_none());
+        let bad_api = fs_module_format_t { path_for_name: oversize_path, try_path: no_module, free: None };
+        assert!(CFsModuleFormat::new(&bad_api).paths_for_name(Path::new("."), "name").is_empty());
+    }
+
+    extern "C" fn failing_context_loader(_: *const c_void, context: *mut run_context_t, _: write_t) -> isize {
+        let mut space = space_new_grounding_space();
+        run_context_init_self_module(context, &mut space, std::ptr::null());
+        space_free(space);
+        let error = std::ffi::CString::new("context refused").unwrap();
+        run_context_raise_error(context, error.as_ptr());
+        0
+    }
+
+    #[test]
+    fn pending_context_error_is_not_ignored_by_a_successful_loader_callback() {
+        let api = module_loader_t { load: Some(failing_context_loader), load_tokens: None, to_string: None, free: None };
+        let runner = Metta::new(Some(hyperon::metta::runner::EnvBuilder::test_env()));
+        let result = runner.load_module_direct(Box::new(CModuleLoader::new(&api)), "failing-context");
+        assert_eq!(result.unwrap_err(), "context refused");
+        assert_eq!(runner.run(hyperon::metta::text::SExprParser::new("!(+ 2 3)")), Ok(vec![vec![hyperon_atom::Atom::gnd(hyperon_atom::gnd::number::Number::Integer(5))]]));
+    }
+}

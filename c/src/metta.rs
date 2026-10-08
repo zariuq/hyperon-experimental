@@ -7,7 +7,6 @@ use hyperon::metta::interpreter;
 use hyperon::metta::interpreter::InterpreterState;
 use hyperon::metta::runner::{Metta, RunContext, RunnerState, Environment, EnvBuilder};
 use hyperon::metta::runner::modules::{ModuleLoader, ModId};
-use hyperon::metta::types::AtomType;
 
 use crate::util::*;
 use crate::atom::*;
@@ -125,20 +124,31 @@ impl Drop for CToken {
 /// @param[in]  regex  A regular expression to match the incoming text, triggering this token to generate a new atom
 /// @param[in]  api  A table of functions to manage the token
 /// @param[in]  context  A caller-defined structure to communicate any state necessary to implement the Token parser
+/// @return `true` if the Token is registered, `false` if `regex` is not a valid regular expression. The `context`
+///    is freed in the latter case
 /// @note Hyperon uses the Rust RegEx engine and syntax, [documented here](https://docs.rs/regex/latest/regex/).
 ///
 #[no_mangle]
 pub extern "C" fn tokenizer_register_token(tokenizer: *mut tokenizer_t,
-    regex: *const c_char, api: *const token_api_t, context: *mut c_void) {
+    regex: *const c_char, api: *const token_api_t, context: *mut c_void) -> bool {
     let tokenizer = unsafe{ &*tokenizer }.borrow_inner();
-    let regex = Regex::new(cstr_as_str(regex)).unwrap();
+    //Take the ownership of the context first, in order to free it if the regular expression is invalid
     let c_token = CToken{ context, api };
-    tokenizer.register_token(regex, move |token| {
+    let regex = match Regex::new(cstr_as_str(regex)) {
+        Ok(regex) => regex,
+        Err(err) => {
+            log::error!("tokenizer_register_token: {}", err);
+            return false;
+        },
+    };
+    tokenizer.register_fallible_token(regex, move |token| {
         let c_token = &c_token; //Be explicit we're capturing c_token, and not the pointers it contains
         let constr = unsafe{ (&*c_token.api).construct_atom };
-        let atom = constr(str_as_cstr(token).as_ptr(), c_token.context);
-        atom.into_inner()
+        let text = std::ffi::CString::new(token).map_err(|_| "C token constructor cannot receive a NUL byte".to_string())?;
+        let atom = constr(text.as_ptr(), c_token.context);
+        Ok(atom.into_inner())
     });
+    true
 }
 
 /// @brief Performs a "deep copy" of a Tokenizer
@@ -258,7 +268,7 @@ pub extern "C" fn sexpr_parser_parse(
     match rust_parser.next_atom(tokenizer) {
         Ok(atom) => atom.into(),
         Err(err) => {
-            let err_cstring = std::ffi::CString::new(err).unwrap();
+            let err_cstring = diagnostic_as_cstr(err);
             parser.err_string = err_cstring.into_raw();
             atom_t::null()
         }
@@ -629,8 +639,9 @@ pub extern "C" fn atom_error_message(atom: *const atom_ref_t, buf: *mut c_char, 
 /// @param[in]  space  A pointer to the `space_t` representing the space context in which to perform the check
 /// @param[in]  atom  A pointer to the `atom_t` or `atom_ref_t` representing the atom whose Type the function will check
 /// @param[in]  typ  A pointer to the `atom_t` or `atom_ref_t` representing the type to check against
-/// @return  `true` if the Atom's Type is a match, otherwise `false`
+/// @return  `true` if a match was established, otherwise `false`
 /// @note This function can be used for a simple type check when there is no need to know type parameters
+/// @note Use `check_type_with_error()` to distinguish a negative result from unfinished search.
 ///
 #[no_mangle]
 pub extern "C" fn check_type(space: *const space_t, atom: *const atom_ref_t, typ: *const atom_ref_t) -> bool {
@@ -640,18 +651,58 @@ pub extern "C" fn check_type(space: *const space_t, atom: *const atom_ref_t, typ
     hyperon::metta::types::check_type(dyn_space, atom, typ)
 }
 
+/// @brief Checks a Type, reporting unfinished search through the error callback
+/// @ingroup metta_language_group
+/// @return `true` on an established match, `false` otherwise
+/// @note On unfinished search, `on_error` receives one error atom before this function returns.
+///    On a completed positive or negative check, the callback is not called.
+/// @note The callback borrows the atom vector; clone atoms that must outlive the callback.
+#[no_mangle]
+pub extern "C" fn check_type_with_error(space: *const space_t, atom: *const atom_ref_t,
+        typ: *const atom_ref_t, on_error: c_atom_vec_callback_t, context: *mut c_void) -> bool {
+    let dyn_space = unsafe{ &*space }.borrow();
+    let atom = unsafe{ &*atom }.borrow();
+    let typ = unsafe{ &*typ }.borrow();
+    match hyperon::metta::types::try_check_type(dyn_space, atom, typ) {
+        Ok(result) => result,
+        Err(error) => {
+            return_atoms(&[error], on_error, context);
+            false
+        }
+    }
+}
+
 /// @brief Checks whether `atom` is correctly typed
 /// @ingroup metta_language_group
 /// @param[in]  space  A pointer to the `space_t` representing the space context in which to perform the check
 /// @param[in]  atom  A pointer to the `atom_t` or `atom_ref_t` representing the atom whose Type the function will check
 /// @return  `true` if the Atom is correctly typed, otherwise `false`
 /// @note This function can be used to check if function arguments have correct types
+/// @note Use `validate_atom_with_error()` to distinguish rejection from unfinished search.
 ///
 #[no_mangle]
 pub extern "C" fn validate_atom(space: *const space_t, atom: *const atom_ref_t) -> bool {
     let dyn_space = unsafe{ &*space }.borrow();
     let atom = unsafe{ &*atom }.borrow();
     hyperon::metta::types::validate_atom(dyn_space, atom)
+}
+
+/// @brief Validates an Atom, reporting unfinished search through the error callback
+/// @ingroup metta_language_group
+/// @return `true` if validation succeeds, `false` otherwise
+/// @note The same error-callback and borrowing contract as `check_type_with_error()` applies.
+#[no_mangle]
+pub extern "C" fn validate_atom_with_error(space: *const space_t, atom: *const atom_ref_t,
+        on_error: c_atom_vec_callback_t, context: *mut c_void) -> bool {
+    let dyn_space = unsafe{ &*space }.borrow();
+    let atom = unsafe{ &*atom }.borrow();
+    match hyperon::metta::types::try_validate_atom(dyn_space, atom) {
+        Ok(result) => result,
+        Err(error) => {
+            return_atoms(&[error], on_error, context);
+            false
+        }
+    }
 }
 
 /// @brief Provides all types for `atom` in the context of `space`
@@ -662,6 +713,7 @@ pub extern "C" fn validate_atom(space: *const space_t, atom: *const atom_ref_t) 
 /// @param[in]  context  A pointer to a caller-defined structure to facilitate communication with the `callback` function
 /// @note `%Undefined%` will be provided if `atom` has no type assigned. An empty vector will be provided if `atom`
 ///    is a function call but expected types of arguments are not compatible with passed values
+/// @note An unfinished subtype search provides one `TypeSearchLimit` error instead of a partial list.
 ///
 #[no_mangle]
 pub extern "C" fn get_atom_types(space: *const space_t, atom: *const atom_ref_t,
@@ -673,7 +725,11 @@ pub extern "C" fn get_atom_types(space: *const space_t, atom: *const atom_ref_t,
     // from the Python and Rust interface as it can be replaced by
     // `get_atom_types().iter().all(AtomType::is_valid)`
     let types: Vec<Atom> = hyperon::metta::types::get_atom_types(dyn_space, atom)
-        .into_iter().filter(AtomType::is_valid).map(AtomType::into_atom).collect();
+        .into_iter().filter_map(|typ| {
+            if typ.is_valid() { Some(typ.into_atom()) }
+            else if typ.is_search_limit() { Some(typ.into_error_unchecked()) }
+            else { None }
+        }).collect();
     return_atoms(&types, callback, context);
 }
 
@@ -1016,7 +1072,7 @@ pub extern "C" fn metta_run(metta: *mut metta_t, parser: sexpr_parser_t,
             }
         },
         Err(err) => {
-            let err_cstring = std::ffi::CString::new(err).unwrap();
+            let err_cstring = diagnostic_as_cstr(err);
             metta.err_string = err_cstring.into_raw();
         }
     }
@@ -1042,7 +1098,7 @@ pub extern "C" fn metta_evaluate_atom(metta: *mut metta_t, atom: atom_t,
     match result {
         Ok(result) => return_atoms(&result, callback, context),
         Err(err) => {
-            let err_cstring = std::ffi::CString::new(err).unwrap();
+            let err_cstring = diagnostic_as_cstr(err);
             metta.err_string = err_cstring.into_raw();
         }
     }
@@ -1072,7 +1128,7 @@ pub extern "C" fn metta_load_module_direct(metta_ref: *mut metta_t,
     match rust_metta.load_module_direct(loader, name) {
         Ok(mod_id) => mod_id.into(),
         Err(err) => {
-            let err_cstring = std::ffi::CString::new(err).unwrap();
+            let err_cstring = diagnostic_as_cstr(err);
             metta.err_string = err_cstring.into_raw();
             ModId::INVALID.into()
         }
@@ -1107,7 +1163,7 @@ pub extern "C" fn metta_load_module_at_path(metta: *mut metta_t,
     match rust_metta.load_module_at_path(path, mod_name) {
         Ok(mod_id) => mod_id.into(),
         Err(err) => {
-            let err_cstring = std::ffi::CString::new(err).unwrap();
+            let err_cstring = diagnostic_as_cstr(err);
             metta.err_string = err_cstring.into_raw();
             ModId::INVALID.into()
         }
@@ -1154,6 +1210,27 @@ impl run_context_t {
             None
         }
     }
+}
+
+impl Drop for run_context_t {
+    fn drop(&mut self) { let _ = self.take_err_string(); }
+}
+
+/// @brief Borrows the error from the last fallible operation on this Run Context
+/// @ingroup module_group
+/// @return The error string, or NULL when there is no error
+/// @warning Valid only during this context's callback, until the error is cleared
+///    or another fallible context operation begins. Do not free the pointer.
+#[no_mangle]
+pub extern "C" fn run_context_err_str(context: *const run_context_t) -> *const c_char {
+    unsafe { &*context }.err_string
+}
+
+/// @brief Clears a handled error on this Run Context
+/// @ingroup module_group
+#[no_mangle]
+pub extern "C" fn run_context_clear_error(context: *mut run_context_t) {
+    let _ = unsafe { &mut *context }.take_err_string();
 }
 
 struct RustRunContext(RunContext<'static, 'static>);
@@ -1363,7 +1440,7 @@ pub extern "C" fn runner_state_step(state: *mut runner_state_t) {
     match rust_state.run_step() {
         Ok(_) => {},
         Err(err) => {
-            let err_cstring = std::ffi::CString::new(err).unwrap();
+            let err_cstring = diagnostic_as_cstr(err);
             state.err_string = err_cstring.into_raw();
         }
     }
@@ -1654,17 +1731,17 @@ pub extern "C" fn run_context_init_self_module(run_context: *mut run_context_t,
 /// @param[in]  run_context  A pointer to the `run_context_t` to access the runner API
 /// @param[in]  name  A C-style string containing the module name
 /// @return  The module_id_t for the loaded module, or `invalid` if there was an error
+/// @note On failure, the diagnostic may be accessed with `run_context_err_str()`.
 ///
 #[no_mangle]
 pub extern "C" fn run_context_load_module(run_context: *mut run_context_t, name: *const c_char) -> module_id_t {
-    let run_context = unsafe{ &mut *run_context }.borrow_mut();
-    let result = run_context.load_module(cstr_as_str(name));
+    let context = unsafe{ &mut *run_context };
+    let _ = context.take_err_string();
+    let result = context.borrow_mut().load_module(cstr_as_str(name));
     match result {
         Ok(mod_id) => mod_id.into(),
-        Err(_err) => {
-            //TODO, propagate the error, so the caller can access it.
-            // let err_cstring = std::ffi::CString::new(err).unwrap();
-            // metta.err_string = err_cstring.into_raw();
+        Err(err) => {
+            context.err_string = diagnostic_as_cstr(err).into_raw();
             ModId::INVALID.into()
         }
     }
@@ -1674,10 +1751,97 @@ pub extern "C" fn run_context_load_module(run_context: *mut run_context_t, name:
 /// @ingroup module_group
 /// @param[in]  run_context  A pointer to the `run_context_t` to access the runner API
 /// @param[in]  mod_id  The loaded `module_id_t` of the module to import
+/// @note A failed export is reported through `run_context_err_str()`. Unhandled
+///    context errors cause the module loader to fail even if its callback returns success.
 ///
 #[no_mangle]
 pub extern "C" fn run_context_import_dependency(run_context: *mut run_context_t, mod_id: module_id_t) {
-    let context = unsafe{ &mut *run_context }.borrow_mut();
+    let context = unsafe{ &mut *run_context };
+    let _ = context.take_err_string();
+    let id = mod_id.into_inner();
+    let result = if id == ModId::INVALID {
+        Err("Invalid ModuleId".to_string())
+    } else {
+        context.borrow_mut().import_all_from_dependency(id)
+    };
+    if let Err(err) = result {
+        context.err_string = diagnostic_as_cstr(err).into_raw();
+    }
+}
 
-    context.import_all_from_dependency(mod_id.into_inner()).unwrap();
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+    use hyperon::metta::runner::EnvBuilder;
+    use hyperon::space::grounding::GroundingSpace;
+    use hyperon::metta::runner::modules::MettaMod;
+
+    extern "C" fn marker_token(_: *const c_char, _: *mut c_void) -> atom_t {
+        Atom::sym("marker").into()
+    }
+
+    #[test]
+    fn c_token_constructor_reports_unrepresentable_nul() {
+        let mut tokenizer = tokenizer_new();
+        let regex = std::ffi::CString::new(".+").unwrap();
+        let api = token_api_t { construct_atom: marker_token, free_context: None };
+        assert!(tokenizer_register_token(&mut tokenizer, regex.as_ptr(), &api, std::ptr::null_mut()));
+        let ordinary = SExprParser::new("ordinary").parse(tokenizer.borrow_inner()).unwrap();
+        assert_eq!(ordinary, Some(Atom::sym("marker")));
+        let error = SExprParser::new("before\0after").parse(tokenizer.borrow_inner()).unwrap_err();
+        assert!(error.contains("NUL byte"), "{error}");
+        tokenizer_free(tokenizer);
+    }
+
+    #[derive(Debug)]
+    struct RefusingExport;
+    impl ModuleLoader for RefusingExport {
+        fn load(&self, context: &mut RunContext) -> Result<(), String> {
+            context.init_self_module(GroundingSpace::new().into(), None);
+            Ok(())
+        }
+        fn load_tokens(&self, target: &MettaMod, _: Metta) -> Result<(), String> {
+            target.tokenizer().borrow_mut().register_token(Regex::new("private-export").unwrap(), |_| Atom::sym("exported"));
+            Err("export refused".into())
+        }
+    }
+
+    #[derive(Debug)]
+    struct VerifyContextExport(ModId);
+
+    fn context_error(context: &run_context_t) -> &str {
+        let error = run_context_err_str(context);
+        assert!(!error.is_null(), "the failed operation must provide a diagnostic");
+        cstr_as_str(error)
+    }
+
+    impl ModuleLoader for VerifyContextExport {
+        fn load(&self, context: &mut RunContext) -> Result<(), String> {
+            context.init_self_module(GroundingSpace::new().into(), None);
+            let mut c_context: run_context_t = (&mut *context).into();
+            run_context_import_dependency(&mut c_context, self.0.into());
+            assert!(context_error(&c_context).contains("export refused"));
+            assert!(!context.module().contains_imported_dep(&self.0));
+            run_context_clear_error(&mut c_context);
+            assert!(run_context_err_str(&c_context).is_null());
+            assert_eq!(SExprParser::new("private-export").parse(&context.module().tokenizer().borrow()).unwrap(), Some(Atom::sym("private-export")));
+            run_context_import_dependency(&mut c_context, ModId::INVALID.into());
+            assert_eq!(context_error(&c_context), "Invalid ModuleId");
+            run_context_clear_error(&mut c_context);
+            let missing = std::ffi::CString::new("no-such-module").unwrap();
+            let id = run_context_load_module(&mut c_context, missing.as_ptr());
+            assert!(!module_id_is_valid(&id));
+            assert!(context_error(&c_context).contains("no-such-module"));
+            run_context_clear_error(&mut c_context);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn failed_context_export_is_reported_and_does_not_publish_a_token() {
+        let runner = Metta::new(Some(EnvBuilder::test_env()));
+        let dependency = runner.load_module_direct(Box::new(RefusingExport), "refusing-export").unwrap();
+        runner.load_module_direct(Box::new(VerifyContextExport(dependency)), "checking-context-errors").unwrap();
+        assert_eq!(runner.run(SExprParser::new("!(+ 2 3)")), Ok(vec![vec![Atom::gnd(hyperon_atom::gnd::number::Number::Integer(5))]]));
+    }
 }

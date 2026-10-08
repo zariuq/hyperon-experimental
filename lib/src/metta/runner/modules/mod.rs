@@ -1,6 +1,7 @@
 
 use std::path::Path;
 use std::cell::RefCell;
+use std::collections::HashSet;
 
 use crate::metta::runner::*;
 use crate::space::module::ModuleSpace;
@@ -59,6 +60,9 @@ pub struct MettaMod {
     space: DynSpace,
     tokenizer: Shared<Tokenizer>,
     imported_deps: Mutex<HashMap<ModId, DynSpace>>,
+    /// Dependencies whose tokens were imported into this module. This is a subset of `imported_deps`,
+    /// which also contains the modules linked as transitive dependencies of an imported module
+    imported_tokens: Mutex<HashSet<ModId>>,
     loader: Option<Box<dyn ModuleLoader>>,
 }
 
@@ -80,6 +84,7 @@ impl MettaMod {
             space,
             tokenizer,
             imported_deps: Mutex::new(HashMap::new()),
+            imported_tokens: Mutex::new(HashSet::new()),
             resource_dir,
             loader: None,
         };
@@ -122,7 +127,7 @@ impl MettaMod {
 
         // Add a new atom to the &self space, so we can access the dependent module
         let dep_space_atom = Atom::gnd(dep_space);
-        self.tokenizer.borrow_mut().register_token_with_regex_str(&new_space_token, move |_| { dep_space_atom.clone() });
+        self.tokenizer.borrow_mut().register_token_with_regex_str(&regex::escape(&new_space_token), move |_| { dep_space_atom.clone() });
 
         Ok(())
     }
@@ -180,13 +185,30 @@ impl MettaMod {
     /// module's space as an atom inside the &self module
     pub(crate) fn import_all_from_dependency(&self, mod_id: ModId, mod_ptr: Rc<MettaMod>, metta: &Metta) -> Result<(), String> {
 
-        // See if the dependency has already been imported
-        if self.contains_imported_dep(&mod_id) {
+        // See if the dependency has already been imported. A module which is only linked as
+        // a transitive dependency of another import doesn't count: its tokens are not imported yet
+        if self.imported_tokens.lock().unwrap().contains(&mod_id) {
             return Ok(())
+        }
+        log::debug!("import_all_from_dependency: importing from {} into {}", mod_ptr.path(), self.path());
+
+        // Import the tokens from the dependency first. If the loader fails, restore the tokenizer
+        // and the record of imported tokens, so that a failed import leaves neither some of the
+        // tokens nor the dependency behind, and the next import is a new attempt
+        if let Some(loader) = &mod_ptr.loader {
+            let tokenizer_before = self.tokenizer.borrow().clone();
+            let imported_tokens_before = self.imported_tokens.lock().unwrap().clone();
+            // The dependency is recorded before the loader runs, so that an import of the same
+            // dependency from inside the loader returns at once instead of running the loader again
+            self.imported_tokens.lock().unwrap().insert(mod_id);
+            if let Err(err) = loader.load_tokens(self, metta.clone()) {
+                **self.tokenizer.borrow_mut() = tokenizer_before;
+                *self.imported_tokens.lock().unwrap() = imported_tokens_before;
+                return Err(err);
+            }
         }
 
         // Get the space associated with the dependent module
-        log::debug!("import_all_from_dependency: importing from {} into {}", mod_ptr.path(), self.path());
         let (dep_space, transitive_deps) = mod_ptr.stripped_space();
 
         // Add a new Grounded Space atom to the &self space, so we can access the dependent module
@@ -199,11 +221,9 @@ impl MettaMod {
             }
         }
 
-        // Finally, Import the tokens from the dependency
-        match &mod_ptr.loader {
-            Some(loader) => loader.load_tokens(self, metta.clone()),
-            None => Ok(()), // no tokens are exported by mod_ptr
-        }
+        // Finally, record that the tokens of the dependency are imported
+        self.imported_tokens.lock().unwrap().insert(mod_id);
+        Ok(())
     }
 
     /// Returns `true` if the `self` module has imported the `mod_id` module as a sub-dependency
@@ -238,6 +258,11 @@ impl MettaMod {
             };
             deps.insert(new_mod_id, space);
         }
+
+        let mut imported_tokens = self.imported_tokens.lock().unwrap();
+        *imported_tokens = imported_tokens.iter()
+            .map(|dep_mod_id| mapping.get(dep_mod_id).copied().unwrap_or(*dep_mod_id))
+            .collect();
     }
 
     /// Private function that returns a deep copy of a module's space, with the module's dependency
@@ -436,7 +461,61 @@ impl ModuleInitState {
     /// Returns the ModId after initializing a module with the provided loader
     ///
     /// The init function will then call `context.init_self_module()` along with any other initialization code
-    pub fn init_module(&mut self, runner: &Metta, mod_name: &str, loader: Box<dyn ModuleLoader>) -> Result<ModId, String> {
+    pub fn init_module(&mut self, runner: &Metta, mod_name: &str, descriptor: Option<ModuleDescriptor>, loader: Box<dyn ModuleLoader>) -> Result<ModId, String> {
+        let normalized_name = normalize_relative_module_name(TOP_MOD_NAME, mod_name)?;
+        if let Self::Root(cell) | Self::Child(cell) = self {
+            let insides = cell.borrow();
+            for frame in &insides.frames {
+                if frame.the_mod.is_some() { continue; }
+                let same_source = match (&descriptor, &frame.loading_descriptor) {
+                    #[cfg(feature = "pkg_mgmt")]
+                    (Some(a), Some(b)) => a.same_source(b),
+                    _ => false,
+                };
+                if frame.path() == normalized_name || same_source {
+                    return Err(format!("Cyclic module import: {normalized_name} is already being loaded as {}", frame.path()));
+                }
+            }
+        }
+        //Remember the frames of the modules which are loading already. If the new module fails to
+        // load, its frame and the frames of its sub-modules must not stay in the state, otherwise
+        // they would be merged into the runner together with the next successfully loaded module
+        let frames_before = self.frames_count();
+        let result = self.init_module_internal(runner, &normalized_name, descriptor, loader);
+        if result.is_err() {
+            self.discard_frames(frames_before);
+        }
+        result
+    }
+
+    /// Returns the number of frames in the state, `None` if no module is loading
+    fn frames_count(&self) -> Option<usize> {
+        match self {
+            Self::None => None,
+            Self::Root(cell) |
+            Self::Child(cell) => Some(cell.borrow().frames.len()),
+        }
+    }
+
+    /// Removes the frames which were added after the state had `frames_before` frames, along
+    /// with the descriptors of the modules loaded in these frames
+    fn discard_frames(&mut self, frames_before: Option<usize>) {
+        match frames_before {
+            None => *self = Self::None,
+            Some(frames_before) => match self {
+                Self::None => {},
+                Self::Root(cell) |
+                Self::Child(cell) => {
+                    let mut insides_ref = cell.borrow_mut();
+                    insides_ref.frames.truncate(frames_before);
+                    insides_ref.module_descriptors.retain(|_descriptor, mod_id|
+                        !mod_id.is_relative() || mod_id.get_idx_from_relative() < frames_before);
+                },
+            },
+        }
+    }
+
+    fn init_module_internal(&mut self, runner: &Metta, mod_name: &str, descriptor: Option<ModuleDescriptor>, loader: Box<dyn ModuleLoader>) -> Result<ModId, String> {
 
         //Give the prepare function a chance to run, in case it hasn't yet
         #[cfg(feature = "pkg_mgmt")]
@@ -448,6 +527,7 @@ impl ModuleInitState {
         //Create a new RunnerState in order to initialize the new module, and push the init function
         // to run within the new RunnerState.  The init function will then call `context.init_self_module()`
         let mut runner_state = RunnerState::new_for_loading(runner, mod_name, self);
+        self.in_frame(runner_state.mod_id, |frame| frame.loading_descriptor = descriptor);
         runner_state.run_in_context(|context| {
             context.push_func(|context| loader.load(context));
             Ok(())
@@ -505,6 +585,8 @@ pub(crate) struct ModuleInitFrame {
     pub the_mod: Option<Rc<MettaMod>>,
     /// Names of additional sub-modules loaded for this frame, relative to `self::path`
     pub sub_module_names: ModNameNode,
+    /// Source identity while initialization is unfinished, including loads under aliases.
+    loading_descriptor: Option<ModuleDescriptor>,
 }
 
 impl ModuleInitFrame {
@@ -514,6 +596,7 @@ impl ModuleInitFrame {
             new_mod_name: Some(new_mod_name),
             the_mod: None,
             sub_module_names: ModNameNode::new(ModId::INVALID),
+            loading_descriptor: None,
         }
     }
     pub fn path(&self) -> &str {
@@ -695,6 +778,47 @@ mod test {
         }
     }
 
+    #[cfg(feature = "pkg_mgmt")]
+    #[test]
+    fn relative_import_cycle_is_rejected_and_leaves_no_frames() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/module_cycles");
+        let runner = Metta::new(Some(EnvBuilder::test_env().push_include_path(&dir)));
+        let error = runner.load_module_at_path(dir.join("relative_a.metta"), None).unwrap_err();
+        assert!(error.contains("Cyclic module import"), "{error}");
+        assert!(runner.get_module_by_name("relative_a").is_err());
+        runner.load_module_at_path(dir.join("valid.metta"), None).unwrap();
+        assert_eq!(runner.run(SExprParser::new("!(import! &self valid) !(cycle-control)")),
+            Ok(vec![vec![UNIT_ATOM], vec![Atom::gnd(Number::Integer(7))]]));
+        assert!(runner.get_module_by_name("relative_a").is_err());
+    }
+
+    #[cfg(feature = "pkg_mgmt")]
+    #[test]
+    fn loading_source_is_not_reopened_under_an_alias() {
+        #[derive(Debug)]
+        struct AliasLoader;
+        impl ModuleLoader for AliasLoader {
+            fn load(&self, context: &mut RunContext) -> Result<(), String> {
+                context.init_self_module(GroundingSpace::new().into(), None);
+                context.get_or_init_module_with_descriptor("top:original:alias",
+                    ModuleDescriptor::new("alias".into(), None, Some(91)), Box::new(InnerLoader))?;
+                Ok(())
+            }
+        }
+        let runner = Metta::new(Some(EnvBuilder::test_env()));
+        let mut state = RunnerState::new(&runner);
+        state.run_in_context(|context| {
+            let error = context.get_or_init_module_with_descriptor("top:original",
+                ModuleDescriptor::new("original".into(), None, Some(91)), Box::new(AliasLoader)).unwrap_err();
+            assert!(error.contains("Cyclic module import"), "{error}");
+            assert!(context.get_module_by_name("original").is_err());
+            context.get_or_init_module_with_descriptor("top:original",
+                ModuleDescriptor::new("original".into(), None, Some(91)), Box::new(InnerLoader))?;
+            Ok(())
+        }).unwrap();
+        assert!(runner.get_module_by_name("original").is_ok());
+    }
+
     /// This tests loading a module as a sub-module of another loaded module using a hierarchical
     /// namespace path
     #[test]
@@ -829,6 +953,304 @@ mod test {
         assert_eq!(*ISSUE_982_CALLED.lock().unwrap(), 6);
     }
 
+
+    #[derive(Debug)]
+    struct TokenExporterLoader;
+
+    impl ModuleLoader for TokenExporterLoader {
+        fn load(&self, context: &mut RunContext) -> Result<(), String> {
+            let space = GroundingSpace::new();
+            context.init_self_module(space.into(), None);
+            self.load_tokens(context.module(), context.metta.clone())
+        }
+
+        fn load_tokens(&self, target: &MettaMod, _metta: Metta) -> Result<(), String> {
+            target.tokenizer().borrow_mut().register_token(Regex::new(r"exported-token").unwrap(),
+                |_| Atom::gnd(Number::Integer(7)));
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct TokenImporterLoader;
+
+    impl ModuleLoader for TokenImporterLoader {
+        fn load(&self, context: &mut RunContext) -> Result<(), String> {
+            let space = GroundingSpace::new();
+            context.init_self_module(space.into(), None);
+
+            let exporter_mod_id = context.get_module_by_name("top:token-exporter")?;
+            context.import_all_from_dependency(exporter_mod_id)?;
+
+            let parser = SExprParser::new("(importer-sees exported-token)");
+            context.push_parser(Box::new(parser));
+
+            Ok(())
+        }
+    }
+
+    /// A module which is linked as a transitive dependency of another import still
+    /// exports its tokens when it is imported directly
+    #[test]
+    fn import_tokens_of_transitive_dependency_test() {
+        let runner = Metta::new(Some(EnvBuilder::test_env()));
+        let seven = Atom::gnd(Number::Integer(7));
+
+        let _exporter_mod_id = runner.load_module_direct(Box::new(TokenExporterLoader), "token-exporter").unwrap();
+        let _importer_mod_id = runner.load_module_direct(Box::new(TokenImporterLoader), "token-importer").unwrap();
+
+        //The importer sees the exporter's token, but doesn't export it further
+        let result = runner.run(SExprParser::new("!(import! &self token-importer)"));
+        assert_eq!(result, Ok(vec![vec![expr!()]]));
+        let result = runner.run(SExprParser::new("!(match &self (importer-sees $x) $x)"));
+        assert_eq!(result, Ok(vec![vec![seven.clone()]]));
+        let result = runner.run(SExprParser::new("! exported-token"));
+        assert_eq!(result, Ok(vec![vec![sym!("exported-token")]]));
+
+        //Importing the exporter directly brings its token in, although the exporter is already
+        // linked as a dependency of the importer
+        let result = runner.run(SExprParser::new("!(import! &self token-exporter)"));
+        assert_eq!(result, Ok(vec![vec![expr!()]]));
+        let result = runner.run(SExprParser::new("! exported-token"));
+        assert_eq!(result, Ok(vec![vec![seven.clone()]]));
+
+        //The atoms of the modules are not duplicated by the second import
+        let result = runner.run(SExprParser::new("!(match &self (importer-sees $x) $x)"));
+        assert_eq!(result, Ok(vec![vec![seven]]));
+    }
+
+    #[derive(Debug)]
+    struct ReentrantTokenLoader;
+
+    static REENTRANT_TOKEN_LOADER_CALLS: Mutex<usize> = Mutex::new(0);
+
+    impl ModuleLoader for ReentrantTokenLoader {
+        fn load(&self, context: &mut RunContext) -> Result<(), String> {
+            let space = GroundingSpace::new();
+            context.init_self_module(space.into(), None);
+            self.load_tokens(context.module(), context.metta.clone())
+        }
+
+        fn load_tokens(&self, target: &MettaMod, metta: Metta) -> Result<(), String> {
+            let calls = {
+                let mut calls = REENTRANT_TOKEN_LOADER_CALLS.lock().unwrap();
+                *calls += 1;
+                *calls
+            };
+            //The first call loads the tokens into the module itself, the second one exports them
+            if calls == 2 {
+                let result = metta.run(SExprParser::new("!(import! &self reentrant-tokens)"));
+                assert_eq!(result, Ok(vec![vec![expr!()]]));
+            }
+            target.tokenizer().borrow_mut().register_token(Regex::new(r"reentrant-token").unwrap(),
+                |_| Atom::gnd(Number::Integer(93)));
+            Ok(())
+        }
+    }
+
+    /// Importing a module from inside its own token loader doesn't run the loader again
+    #[test]
+    fn import_from_inside_token_loader_test() {
+        let runner = Metta::new(Some(EnvBuilder::test_env()));
+
+        let _mod_id = runner.load_module_direct(Box::new(ReentrantTokenLoader), "reentrant-tokens").unwrap();
+
+        let result = runner.run(SExprParser::new("!(import! &self reentrant-tokens)"));
+        assert_eq!(result, Ok(vec![vec![expr!()]]));
+        assert_eq!(*REENTRANT_TOKEN_LOADER_CALLS.lock().unwrap(), 2);
+        let result = runner.run(SExprParser::new("! reentrant-token"));
+        assert_eq!(result, Ok(vec![vec![Atom::gnd(Number::Integer(93))]]));
+    }
+
+    #[derive(Debug)]
+    struct FailingTokenLoader;
+
+    static FAILING_TOKEN_LOADER_FAILS: Mutex<bool> = Mutex::new(true);
+
+    impl ModuleLoader for FailingTokenLoader {
+        fn load(&self, context: &mut RunContext) -> Result<(), String> {
+            let space = GroundingSpace::new();
+            context.init_self_module(space.into(), None);
+
+            let parser = SExprParser::new("failing-module-test-atom");
+            context.push_parser(Box::new(parser));
+
+            Ok(())
+        }
+
+        fn load_tokens(&self, target: &MettaMod, _metta: Metta) -> Result<(), String> {
+            target.tokenizer().borrow_mut().register_token(Regex::new(r"first-token").unwrap(),
+                |_| Atom::gnd(Number::Integer(91)));
+            if *FAILING_TOKEN_LOADER_FAILS.lock().unwrap() {
+                return Err("token loading failed".into());
+            }
+            target.tokenizer().borrow_mut().register_token(Regex::new(r"second-token").unwrap(),
+                |_| Atom::gnd(Number::Integer(92)));
+            Ok(())
+        }
+    }
+
+    /// A failed import leaves neither a part of the module's tokens nor its atoms behind,
+    /// and doesn't prevent a later import from succeeding
+    #[test]
+    fn failed_token_import_is_not_partial_test() {
+        let runner = Metta::new(Some(EnvBuilder::test_env()));
+
+        let _failing_mod_id = runner.load_module_direct(Box::new(FailingTokenLoader), "failing-tokens").unwrap();
+
+        //The import fails after the first token is registered
+        let result = runner.run(SExprParser::new("!(import! &self failing-tokens)")).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].len(), 1);
+        assert!(atom_is_error(&result[0][0]));
+
+        //Neither the token registered before the failure nor the module's atoms are visible
+        let result = runner.run(SExprParser::new("! first-token"));
+        assert_eq!(result, Ok(vec![vec![sym!("first-token")]]));
+        let result = runner.run(SExprParser::new("!(match &self failing-module-test-atom found!)"));
+        assert_eq!(result, Ok(vec![vec![]]));
+
+        //The next import is a new attempt, and it brings in the complete module
+        *FAILING_TOKEN_LOADER_FAILS.lock().unwrap() = false;
+        let result = runner.run(SExprParser::new("!(import! &self failing-tokens)"));
+        assert_eq!(result, Ok(vec![vec![expr!()]]));
+        let result = runner.run(SExprParser::new("! first-token"));
+        assert_eq!(result, Ok(vec![vec![Atom::gnd(Number::Integer(91))]]));
+        let result = runner.run(SExprParser::new("! second-token"));
+        assert_eq!(result, Ok(vec![vec![Atom::gnd(Number::Integer(92))]]));
+        let result = runner.run(SExprParser::new("!(match &self failing-module-test-atom found!)"));
+        assert_eq!(result, Ok(vec![vec![sym!("found!")]]));
+    }
+
+    #[derive(Debug)]
+    struct BrokenLoader;
+
+    impl ModuleLoader for BrokenLoader {
+        fn load(&self, _context: &mut RunContext) -> Result<(), String> {
+            Err("broken module".into())
+        }
+    }
+
+    /// A module which failed to load doesn't prevent the next module from loading
+    #[test]
+    fn load_module_after_failed_module_test() {
+        let runner = Metta::new(Some(EnvBuilder::test_env()));
+
+        let mut state = RunnerState::new_with_module(&runner, ModId::TOP);
+        state.run_in_context(|context| {
+            assert!(context.load_module_direct(Box::new(BrokenLoader), "broken").is_err());
+            context.load_module_direct(Box::new(InnerLoader), "inner")
+        }).unwrap();
+
+        assert!(runner.get_module_by_name("broken").is_err());
+        runner.get_module_by_name("inner").unwrap();
+    }
+
+    #[derive(Debug)]
+    struct OuterWithBrokenSubModuleLoader;
+
+    impl ModuleLoader for OuterWithBrokenSubModuleLoader {
+        fn load(&self, context: &mut RunContext) -> Result<(), String> {
+            let space = GroundingSpace::new();
+            context.init_self_module(space.into(), None);
+
+            assert!(context.load_module_direct(Box::new(BrokenLoader), "self:broken").is_err());
+            let _inner_mod_id = context.load_module_direct(Box::new(InnerLoader), "self:inner")?;
+
+            Ok(())
+        }
+    }
+
+    /// A sub-module which failed to load doesn't prevent its parent and siblings from loading
+    #[test]
+    fn load_module_after_failed_sub_module_test() {
+        let runner = Metta::new(Some(EnvBuilder::test_env()));
+
+        let _outer_mod_id = runner.load_module_direct(Box::new(OuterWithBrokenSubModuleLoader), "outer").unwrap();
+
+        assert!(runner.get_module_by_name("outer:broken").is_err());
+        runner.get_module_by_name("outer:inner").unwrap();
+    }
+
+    /// A module which has nothing but the MeTTa source to be included
+    #[derive(Debug)]
+    struct SourceLoader(&'static str);
+
+    impl ModuleLoader for SourceLoader {
+        fn load(&self, context: &mut RunContext) -> Result<(), String> {
+            let space = GroundingSpace::new();
+            context.init_self_module(space.into(), None);
+            Ok(())
+        }
+
+        fn get_resource(&self, res_key: ResourceKey) -> Result<Resource, String> {
+            match res_key {
+                ResourceKey::MainMettaSrc => Ok(Resource::Bytes(std::io::Cursor::new(self.0.as_bytes().to_vec()))),
+                _ => Err("resource not found".to_string()),
+            }
+        }
+    }
+
+    /// The code which is included can import modules and include other code
+    #[test]
+    fn import_and_include_inside_include_test() {
+        let runner = Metta::new(Some(EnvBuilder::test_env()));
+        let seven = Atom::gnd(Number::Integer(7));
+
+        let _exporter_mod_id = runner.load_module_direct(Box::new(TokenExporterLoader), "token-exporter").unwrap();
+        let _inner_mod_id = runner.load_module_direct(Box::new(SourceLoader(
+            "(inner-fact exported-token)")), "inner-src").unwrap();
+        let _outer_mod_id = runner.load_module_direct(Box::new(SourceLoader(
+            "!(import! &self token-exporter) !(include inner-src) (outer-fact exported-token)")), "outer-src").unwrap();
+
+        let result = runner.run(SExprParser::new("!(include outer-src)"));
+        assert_eq!(result, Ok(vec![vec![]]));
+        let result = runner.run(SExprParser::new("!(match &self (inner-fact $x) $x)"));
+        assert_eq!(result, Ok(vec![vec![seven.clone()]]));
+        let result = runner.run(SExprParser::new("!(match &self (outer-fact $x) $x)"));
+        assert_eq!(result, Ok(vec![vec![seven]]));
+    }
+
+    /// A parse error in the code which is included is returned by `include`
+    #[test]
+    fn parse_error_inside_include_test() {
+        let runner = Metta::new(Some(EnvBuilder::test_env()));
+
+        let _mod_id = runner.load_module_direct(Box::new(SourceLoader(
+            "(before-fact 1) (unclosed \"string (after-fact 2)")), "unclosed-src").unwrap();
+
+        let result = runner.run(SExprParser::new("!(include unclosed-src)")).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].len(), 1);
+        assert!(atom_is_error(&result[0][0]));
+
+        //The atoms which precede the error are added
+        let result = runner.run(SExprParser::new("!(match &self (before-fact $x) $x)"));
+        assert_eq!(result, Ok(vec![vec![Atom::gnd(Number::Integer(1))]]));
+    }
+
+    /// The names passed to `bind!` and `import!` match only themselves
+    #[test]
+    fn token_names_are_not_regular_expressions_test() {
+        let runner = Metta::new(Some(EnvBuilder::test_env()));
+        let _outer_mod_id = runner.load_module_direct(Box::new(OuterLoader), "outer").unwrap();
+
+        let result = runner.run(SExprParser::new("!(bind! a.c 5) !(bind! *star* 3)"));
+        assert_eq!(result, Ok(vec![vec![expr!()], vec![expr!()]]));
+        let result = runner.run(SExprParser::new("! abc"));
+        assert_eq!(result, Ok(vec![vec![sym!("abc")]]));
+        let result = runner.run(SExprParser::new("! a.c"));
+        assert_eq!(result, Ok(vec![vec![Atom::gnd(Number::Integer(5))]]));
+        let result = runner.run(SExprParser::new("! *star*"));
+        assert_eq!(result, Ok(vec![vec![Atom::gnd(Number::Integer(3))]]));
+
+        let result = runner.run(SExprParser::new("!(import! m.d[ outer)"));
+        assert_eq!(result, Ok(vec![vec![expr!()]]));
+        let result = runner.run(SExprParser::new("! &mXd["));
+        assert_eq!(result, Ok(vec![vec![sym!("&mXd[")]]));
+        let result = runner.run(SExprParser::new("!(match &m.d[ outer-module-test-atom found!)"));
+        assert_eq!(result, Ok(vec![vec![sym!("found!")]]));
+    }
 
     //LP-TODO-NEXT,  Make a test for an inner-loader that throws an error, blocking the outer-loader from loading sucessfully,
     // and make sure neither module is loaded into the named index

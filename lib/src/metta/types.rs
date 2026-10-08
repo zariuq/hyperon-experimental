@@ -19,12 +19,46 @@
 //! of `%Undefined%` type can be matched with any type required.
 
 use super::*;
-use hyperon_atom::matcher::{Bindings, BindingsSet, apply_bindings_to_atom_move};
+use hyperon_atom::matcher::{Bindings, BindingsSet, apply_bindings_to_atom_move, atoms_are_equivalent};
 use hyperon_space::DynSpace;
 
 use std::fmt::{Display, Debug};
 use itertools::Itertools;
 use hyperon_atom::gnd::number::Number;
+use std::cell::Cell;
+
+/// Default bound on the depth of subtype derivations: 0, which means no bound. The search for
+/// supertypes is bounded only when the user sets a bound, like the interpreter's stack depth.
+pub const DEFAULT_TYPE_SEARCH_DEPTH: usize = 0;
+thread_local! {
+    static TYPE_SEARCH_DEPTH: Cell<usize> = const { Cell::new(DEFAULT_TYPE_SEARCH_DEPTH) };
+}
+
+pub(crate) struct TypeSearchScope(usize);
+impl Drop for TypeSearchScope {
+    fn drop(&mut self) { TYPE_SEARCH_DEPTH.with(|limit| limit.set(self.0)); }
+}
+
+pub(crate) fn type_search_depth() -> usize { TYPE_SEARCH_DEPTH.with(Cell::get) }
+
+pub(crate) fn scoped_type_search_depth(depth: usize) -> TypeSearchScope {
+    TypeSearchScope(TYPE_SEARCH_DEPTH.with(|limit| limit.replace(depth)))
+}
+
+fn type_search_limit_error(atom: Atom, depth: usize) -> Atom {
+    Atom::expr([ERROR_SYMBOL, atom, Atom::expr([sym!("TypeSearchLimit"), Atom::gnd(Number::Integer(depth.min(i64::MAX as usize) as i64))])])
+}
+
+pub(crate) fn is_type_search_limit_error(error: &Atom) -> bool {
+    match error {
+        Atom::Expression(expr) => match expr.children() {
+            [op, _, Atom::Expression(reason)] if *op == ERROR_SYMBOL =>
+                reason.children().first() == Some(&sym!("TypeSearchLimit")),
+            _ => false,
+        },
+        _ => false,
+    }
+}
 
 fn typeof_query(atom: &Atom, typ: &Atom) -> Atom {
     Atom::expr(vec![HAS_TYPE_SYMBOL, atom.clone(), typ.clone()])
@@ -46,20 +80,90 @@ fn query_super_types(space: &DynSpace, sub_type: &Atom) -> Vec<Atom> {
     super_types.into_iter().map(|bindings| { apply_bindings_to_atom_move(atom_x.clone(), &bindings) }).collect()
 }
 
-fn add_super_types(space: &DynSpace, sub_types: &mut Vec<Atom>, from: usize) {
-    let mut types = Vec::new();
-    sub_types.iter().skip(from).for_each(|typ| {
-        for typ in query_super_types(space, typ) {
-            if !sub_types.contains(&typ) {
-                types.push(typ);
-            }
-        }
-    });
-    if !types.is_empty() {
-        let from = sub_types.len();
-        sub_types.append(&mut types.clone());
-        add_super_types(space, sub_types, from);
+/// Lazily enumerates types followed by their supertypes.
+///
+/// The enumeration proceeds in rounds. A round adds each supertype of the types found by the
+/// previous round, unless the supertype was known before the round started. Two equal
+/// supertypes found by the same round are both kept. A round is computed only when all the
+/// types found before are consumed, so a check can stop as soon as it finds a matching type,
+/// while a complete enumeration returns the same types in the same order as an eager search.
+///
+/// A supertype which repeats one of its own ancestors up to renaming of variables is not
+/// added. Such a supertype comes from a declaration which introduces a fresh variable on each
+/// use, for example `(:< A $x)`: adding it would only produce the same ancestors again under
+/// new variable names, without end.
+struct TypeClosure<'a> {
+    space: &'a DynSpace,
+    types: Vec<Atom>,
+    /// For each type the index of the type it was derived from
+    parents: Vec<Option<usize>>,
+    yielded: usize,
+    /// Index of the first type found by the last round
+    round_start: usize,
+    /// Number of the rounds which added types
+    depth: usize,
+    /// Maximum number of such rounds, 0 means no limit
+    limit: usize,
+    finished: bool,
+}
+
+impl<'a> TypeClosure<'a> {
+    fn new(space: &'a DynSpace, types: Vec<Atom>, from: usize) -> Self {
+        let parents = vec![None; types.len()];
+        Self { space, types, parents, yielded: 0, round_start: from, depth: 0,
+            limit: type_search_depth(), finished: false }
     }
+
+    fn repeats_ancestor(&self, index: usize, typ: &Atom) -> bool {
+        let mut ancestor = Some(index);
+        while let Some(index) = ancestor {
+            if atoms_are_equivalent(&self.types[index], typ) {
+                return true;
+            }
+            ancestor = self.parents[index];
+        }
+        false
+    }
+}
+
+impl Iterator for TypeClosure<'_> {
+    type Item = Result<Atom, usize>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished { return None; }
+        if self.yielded == self.types.len() {
+            let mut found = Vec::new();
+            for index in self.round_start..self.types.len() {
+                for super_type in query_super_types(self.space, &self.types[index]) {
+                    if !self.types.contains(&super_type) && !self.repeats_ancestor(index, &super_type) {
+                        found.push((super_type, index));
+                    }
+                }
+            }
+            if found.is_empty() {
+                self.finished = true;
+                return None;
+            }
+            if self.limit > 0 && self.depth == self.limit {
+                self.finished = true;
+                return Some(Err(self.limit));
+            }
+            self.round_start = self.types.len();
+            for (super_type, parent) in found {
+                self.types.push(super_type);
+                self.parents.push(Some(parent));
+            }
+            self.depth += 1;
+        }
+        let typ = self.types[self.yielded].clone();
+        self.yielded += 1;
+        Some(Ok(typ))
+    }
+}
+
+fn add_super_types(space: &DynSpace, sub_types: &mut Vec<Atom>, from: usize) -> Result<(), usize> {
+    *sub_types = TypeClosure::new(space, std::mem::take(sub_types), from).collect::<Result<_, _>>()?;
+    Ok(())
 }
 
 fn check_arg_types(actual: &[Vec<AtomType>], meta: &[Vec<Atom>], types: &mut Vec<AtomType>, expected: &[Atom], ret_typ: &Atom, atom: &Atom, fn_type_atom: &Atom) -> () {
@@ -133,20 +237,22 @@ pub fn is_func(typ: &Atom) -> bool {
     }
 }
 
-fn query_types(space: &DynSpace, atom: &Atom) -> Vec<Atom> {
+fn query_types_direct(space: &DynSpace, atom: &Atom) -> Vec<Atom> {
     let var_x = VariableAtom::new("X").make_unique();
     let types = query_has_type(space, atom, &Atom::Variable(var_x.clone()));
     let atom_x = Atom::Variable(var_x);
-    let mut types = types.into_iter().filter_map(|bindings| {
+    types.into_iter().filter_map(|bindings| {
         let atom = apply_bindings_to_atom_move(atom_x.clone(), &bindings);
         if atom_x == atom || atom == ATOM_TYPE_UNDEFINED {
             None
         } else {
             Some(atom)
         }
-    }).collect();
-    add_super_types(space, &mut types, 0);
-    types
+    }).collect()
+}
+
+fn query_types(space: &DynSpace, atom: &Atom) -> Result<Vec<Atom>, usize> {
+    TypeClosure::new(space, query_types_direct(space, atom), 0).collect()
 }
 
 /// Splits function type on array of argument types and return type.
@@ -229,6 +335,15 @@ impl AtomType {
     #[inline]
     pub fn is_error(&self) -> bool {
         matches!(self.info, TypeInfo::ApplicationError{..})
+    }
+
+    /// Whether this result reports an unfinished, depth-bounded type search.
+    pub fn is_search_limit(&self) -> bool {
+        self.get_error().map_or(false, is_type_search_limit_error)
+    }
+
+    fn search_limit(atom: &Atom, depth: usize) -> Self {
+        Self::error(ATOM_TYPE_UNDEFINED, type_search_limit_error(atom.clone(), depth))
     }
 
     #[inline]
@@ -333,6 +448,29 @@ pub fn get_atom_types(space: &DynSpace, atom: &Atom) -> Vec<AtomType> {
     }
 }
 
+/// Query complete type information with an explicit subtype-derivation bound.
+/// An unfinished closure yields only a `TypeSearchLimit` error, never a partial type list.
+pub fn get_atom_types_with_limit(space: &DynSpace, atom: &Atom, max_depth: usize) -> Vec<AtomType> {
+    let _scope = scoped_type_search_depth(max_depth);
+    get_atom_types(space, atom)
+}
+
+/// Lazy type search for existential checks. Atomic symbols expand breadth-first;
+/// consumers must propagate the final error if they have not established a match.
+pub(crate) fn iter_atom_types<'a>(space: &'a DynSpace, atom: &Atom) -> Box<dyn Iterator<Item = AtomType> + 'a> {
+    if matches!(atom, Atom::Symbol(_)) {
+        let seeds = query_types_direct(space, atom);
+        if seeds.is_empty() { return Box::new(std::iter::once(AtomType::undefined())); }
+        let atom = atom.clone();
+        Box::new(TypeClosure::new(space, seeds, 0).map(move |typ| match typ {
+            Ok(typ) => AtomType::value(typ),
+            Err(depth) => AtomType::search_limit(&atom, depth),
+        }))
+    } else {
+        Box::new(get_atom_types(space, atom).into_iter())
+    }
+}
+
 struct ExprTypeInfo {
     op_value_types: Vec<AtomType>,
     op_func_types: Vec<AtomType>,
@@ -392,8 +530,10 @@ fn get_atom_types_internal(space: &DynSpace, atom: &Atom) -> Vec<AtomType> {
                 vec![AtomType::value(make_variables_unique(gnd.type_()))]
             }
         },
-        Atom::Symbol(_) => query_types(space, atom).into_iter()
-            .map(AtomType::value).collect(),
+        Atom::Symbol(_) => match query_types(space, atom) {
+            Ok(types) => types.into_iter().map(AtomType::value).collect(),
+            Err(depth) => vec![AtomType::search_limit(atom, depth)],
+        },
         // TODO: empty expression should have unit type (->), but type checking
         // code cannot handle functional type which doesn't return value
         Atom::Expression(expr) if expr.children().len() == 0 => vec![],
@@ -406,7 +546,9 @@ fn get_atom_types_internal(space: &DynSpace, atom: &Atom) -> Vec<AtomType> {
         },
     };
     log::debug!("get_atom_types_internal: return atom {} types {}", atom, types.iter().format(", "));
-    types
+    if types.iter().any(AtomType::is_search_limit) {
+        types.into_iter().filter(AtomType::is_search_limit).collect()
+    } else { types }
 }
 
 struct TupleIndex<'a> {
@@ -475,6 +617,9 @@ impl<'a> Iterator for TupleIndex<'a> {
 }
 
 fn get_tuple_types(space: &DynSpace, atom: &Atom, type_info: &ExprTypeInfo) -> Vec<AtomType> {
+    let incomplete: Vec<_> = type_info.op_value_types.iter().chain(&type_info.op_func_types)
+        .chain(type_info.arg_types.iter().flatten()).filter(|typ| typ.is_search_limit()).cloned().collect();
+    if !incomplete.is_empty() { return incomplete; }
     let mut types = if let Some(index) = TupleIndex::new(type_info) {
         let mut types = Vec::with_capacity(index.size());
         index.for_each(|v| types.push(Atom::expr(v)));
@@ -483,8 +628,13 @@ fn get_tuple_types(space: &DynSpace, atom: &Atom, type_info: &ExprTypeInfo) -> V
         vec![]
     };
 
-    types.append(&mut query_types(space, atom));
-    add_super_types(space, &mut types, 0);
+    match query_types(space, atom) {
+        Ok(mut declared) => types.append(&mut declared),
+        Err(depth) => return vec![AtomType::search_limit(atom, depth)],
+    }
+    if let Err(depth) = add_super_types(space, &mut types, 0) {
+        return vec![AtomType::search_limit(atom, depth)];
+    }
     // FIXME: ineffective
     let types: Vec<AtomType> = types.into_iter().map(AtomType::value).collect();
     log::trace!("get_tuple_types: tuple {} types {}", atom, types.iter().format(", "));
@@ -573,15 +723,6 @@ fn replace_undefined_types(atom: &Atom) -> Atom {
     atom
 }
 
-fn get_matched_types(space: &DynSpace, atom: &Atom, typ: &Atom) -> Vec<(Atom, Bindings)> {
-    let types = get_atom_types(space, atom);
-    types.into_iter().filter(AtomType::is_valid).flat_map(|t| {
-        // TODO: write a unit test
-        let t = make_variables_unique(t.into_atom());
-        match_reducted_types(&t, typ).map(move |bindings| (t.clone(), bindings))
-    }).collect()
-}
-
 /// Checks if passed `atom` has the given `typ` in context of the given `space`.
 /// This function can be used for a simple type check when there is no need
 /// to know type parameters.
@@ -600,7 +741,21 @@ fn get_matched_types(space: &DynSpace, atom: &Atom, typ: &Atom) -> Vec<(Atom, Bi
 /// assert!(check_type(&metta.space(), &expr!("a"), &expr!("B")));
 /// ```
 pub fn check_type(space: &DynSpace, atom: &Atom, typ: &Atom) -> bool {
-    check_meta_type(atom, typ) || !get_matched_types(space, atom, typ).is_empty()
+    try_check_type(space, atom, typ).unwrap_or(false)
+}
+
+/// Check a type without conflating exhausted search with a negative result.
+/// The boolean `check_type` wrapper reports whether a type was established;
+/// use this function when an indeterminate result needs to be distinguished.
+pub fn try_check_type(space: &DynSpace, atom: &Atom, typ: &Atom) -> Result<bool, Atom> {
+    if check_meta_type(atom, typ) { return Ok(true); }
+    for actual in iter_atom_types(space, atom) {
+        if actual.is_search_limit() { return Err(actual.into_error_unchecked()); }
+        if actual.is_valid() && match_reducted_types(&make_variables_unique(actual.into_atom()), typ).next().is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub fn get_meta_type(atom: &Atom) -> Atom {
@@ -635,7 +790,16 @@ fn check_meta_type(atom: &Atom, typ: &Atom) -> bool {
 /// assert!(!validate_atom(&space, &expr!("foo" "b")));
 /// ```
 pub fn validate_atom(space: &DynSpace, atom: &Atom) -> bool {
-    get_atom_types_internal(space, atom).iter().all(AtomType::is_valid)
+    try_validate_atom(space, atom).unwrap_or(false)
+}
+
+/// Validate without treating an unfinished search as a refutation.
+pub fn try_validate_atom(space: &DynSpace, atom: &Atom) -> Result<bool, Atom> {
+    let types = get_atom_types_internal(space, atom);
+    if let Some(error) = types.iter().find(|typ| typ.is_search_limit()) {
+        return Err(error.get_error().unwrap().clone());
+    }
+    Ok(types.iter().all(AtomType::is_valid))
 }
 
 #[cfg(test)]
@@ -755,6 +919,82 @@ mod tests {
         ");
 
         assert!(check_type(&space, &atom("a"), &atom("C")));
+    }
+
+    #[test]
+    fn unbound_supertype_variable_is_not_reexpanded_by_its_fresh_name() {
+        let space = metta_space("(: a A) (:< A $z)");
+        let types = get_atom_types(&space, &sym!("a"));
+        assert_eq!(types.len(), 2);
+        assert!(types.contains(&AtomType::value(sym!("A"))));
+        assert!(types.iter().any(|typ| matches!(typ.as_atom(), Atom::Variable(_))));
+        assert!(check_type(&space, &sym!("a"), &sym!("B")));
+    }
+
+    #[test]
+    fn supertype_search_keeps_order_and_multiplicity_of_the_eager_search() {
+        // D is found twice by the same round, once through B and once through C
+        let space = metta_space("(: a A) (:< A B) (:< A C) (:< B D) (:< C D) (:< D A)");
+        assert_eq!(get_atom_types(&space, &sym!("a")),
+            vec![typ!(A), typ!(B), typ!(C), typ!(D), typ!(D)]);
+        let space = metta_space("(: a A) (:< A C) (:< A B) (:< C D) (:< B D)");
+        assert_eq!(get_atom_types(&space, &sym!("a")),
+            vec![typ!(A), typ!(C), typ!(B), typ!(D), typ!(D)]);
+        // Types which differ only by names of variables are kept when they are not
+        // derived from one another
+        let space = metta_space("(: a A) (:< A (Pair $x $x)) (:< A (Pair $x $y))");
+        assert_eq!(get_atom_types(&space, &sym!("a")).len(), 3);
+        let space = metta_space("(: a A) (:< A (Box $y)) (:< A B) (:< B (Box $z))");
+        assert_eq!(get_atom_types(&space, &sym!("a")).len(), 4);
+    }
+
+    #[test]
+    fn long_subtype_chain_is_enumerated_without_a_limit() {
+        let mut program = String::from("(: a T0)");
+        for i in 0..300 {
+            program.push_str(&format!(" (:< T{} T{})", i, i + 1));
+        }
+        let space = metta_space(&program);
+        assert_eq!(get_atom_types(&space, &sym!("a")).len(), 301);
+        assert!(check_type(&space, &sym!("a"), &sym!("T300")));
+        assert_eq!(get_atom_types_with_limit(&space, &sym!("a"), 64), vec![AtomType::search_limit(&sym!("a"), 64)]);
+    }
+
+    #[test]
+    fn incomplete_type_closure_is_not_a_partial_answer() {
+        let space = metta_space("(: a (F x)) (:< (F $x) (F (F $x)))");
+        let types = get_atom_types_with_limit(&space, &sym!("a"), 3);
+        assert_eq!(types, vec![AtomType::search_limit(&sym!("a"), 3)]);
+        let _scope = scoped_type_search_depth(3);
+        assert_eq!(try_check_type(&space, &sym!("a"), &expr!("F" ("F" "x"))), Ok(true));
+        assert!(is_type_search_limit_error(&try_check_type(&space, &sym!("a"), &sym!("Unreachable")).unwrap_err()));
+    }
+
+    #[test]
+    fn depth_limit_distinguishes_completion_from_frontier_exhaustion() {
+        let space = metta_space("(: a A) (:< A B) (:< A C) (:< B D) (:< C D) (:< D A)");
+        assert_eq!(get_atom_types_with_limit(&space, &sym!("a"), 1), vec![AtomType::search_limit(&sym!("a"), 1)]);
+        assert_eq_no_order!(get_atom_types_with_limit(&space, &sym!("a"), 2),
+            vec![typ!(A), typ!(B), typ!(C), typ!(D), typ!(D)]);
+        let reordered = metta_space("(: a A) (:< D A) (:< C D) (:< B D) (:< A C) (:< A B)");
+        assert_eq!(get_atom_types_with_limit(&reordered, &sym!("a"), 1), vec![AtomType::search_limit(&sym!("a"), 1)]);
+        assert_eq_no_order!(get_atom_types_with_limit(&reordered, &sym!("a"), 2),
+            vec![typ!(A), typ!(B), typ!(C), typ!(D), typ!(D)]);
+        assert_eq!(get_atom_types_with_limit(&metta_space("(: a A) (:< A A)"), &sym!("a"), 0), vec![typ!(A)]);
+    }
+
+    #[test]
+    fn nested_type_search_scope_restores_outer_policy() {
+        let before = type_search_depth();
+        let outer = scoped_type_search_depth(7);
+        assert_eq!(type_search_depth(), 7);
+        {
+            let _inner = scoped_type_search_depth(2);
+            assert_eq!(type_search_depth(), 2);
+        }
+        assert_eq!(type_search_depth(), 7);
+        drop(outer);
+        assert_eq!(type_search_depth(), before);
     }
 
     #[test]

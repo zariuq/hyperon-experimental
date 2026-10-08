@@ -61,8 +61,12 @@ class GroundingSpace(AbstractSpace):
     def __init__(self):
         """Initialize GroundingSpace and its underlying native implementation."""
         super().__init__()
-        # self.cspace = hp.space_new_grounding()
         self.gspace = GroundingSpaceRef()
+
+    @property
+    def cspace(self):
+        """Return the native handle expected by MeTTa."""
+        return self.gspace.cspace
 
     def query(self, query_atom):
         """
@@ -183,7 +187,8 @@ class SpaceRef:
 
     def __del__(self):
         """Free the underlying CSpace object """
-        hp.space_free(self.cspace)
+        if hasattr(self, "cspace"):
+            hp.space_free(self.cspace)
 
     def __eq__(self, other):
         """Compare two SpaceRef objects for equality, based on their underlying spaces."""
@@ -449,6 +454,8 @@ def check_type(gnd_space, atom, type):
     """
     Checks whether the given Atom has the specified type in the given space context.
 
+    Raises RuntimeError on unfinished type search rather than reporting False.
+
     Parameters
     ----------
     gnd_space:
@@ -467,6 +474,8 @@ def validate_atom(gnd_space, atom):
     """
     Checks whether the given Atom is correctly typed.
 
+    Raises RuntimeError on unfinished type search rather than reporting False.
+
     Parameters
     ----------
     gnd_space:
@@ -483,7 +492,7 @@ def validate_atom(gnd_space, atom):
     return hp.validate_atom(gnd_space.cspace, atom.catom)
 
 def get_atom_types(gnd_space, atom):
-    """Provides all types for the given Atom in the context of the given Space."""
+    """Provides all types, or a TypeSearchLimit error if enumeration is unfinished."""
     result = hp.get_atom_types(gnd_space.cspace, atom.catom)
     return [Atom._from_catom(catom) for catom in result]
 

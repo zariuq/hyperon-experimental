@@ -7,7 +7,8 @@ use hyperon_atom::gnd::GroundedFunctionAtom;
 
 use std::rc::Rc;
 use std::cell::RefCell;
-use std::fmt::Display;
+use std::fmt::{Display, Debug};
+use std::collections::HashSet;
 
 #[derive(Clone, Debug)]
 pub struct NewSpaceOp {}
@@ -35,9 +36,46 @@ impl CustomExecute for NewSpaceOp {
     }
 }
 
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone)]
 pub struct StateAtom {
     state: Rc<RefCell<(Atom, Atom)>>
+}
+
+type StateIdentity = *const RefCell<(Atom, Atom)>;
+thread_local! {
+    static DISPLAY_STATES: RefCell<HashSet<StateIdentity>> = RefCell::new(HashSet::new());
+    static COMPARED_STATES: RefCell<HashSet<(StateIdentity, StateIdentity)>> = RefCell::new(HashSet::new());
+}
+
+struct StateDisplayGuard(StateIdentity);
+impl Drop for StateDisplayGuard {
+    fn drop(&mut self) {
+        DISPLAY_STATES.with(|states| { states.borrow_mut().remove(&self.0); });
+    }
+}
+
+struct StateEqualityGuard((StateIdentity, StateIdentity));
+impl Drop for StateEqualityGuard {
+    fn drop(&mut self) {
+        COMPARED_STATES.with(|states| { states.borrow_mut().remove(&self.0); });
+    }
+}
+
+impl PartialEq for StateAtom {
+    fn eq(&self, other: &Self) -> bool {
+        let pair = (Rc::as_ptr(&self.state), Rc::as_ptr(&other.state));
+        if !COMPARED_STATES.with(|states| states.borrow_mut().insert(pair)) {
+            return true;
+        }
+        let _guard = StateEqualityGuard(pair);
+        *self.state.borrow() == *other.state.borrow()
+    }
+}
+
+impl Debug for StateAtom {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Display::fmt(self, f)
+    }
 }
 
 impl StateAtom {
@@ -48,6 +86,11 @@ impl StateAtom {
 
 impl Display for StateAtom {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let identity = Rc::as_ptr(&self.state);
+        if !DISPLAY_STATES.with(|states| states.borrow_mut().insert(identity)) {
+            return write!(f, "(State <cycle>)");
+        }
+        let _guard = StateDisplayGuard(identity);
         write!(f, "(State {})", self.state.borrow().0)
     }
 }
@@ -320,5 +363,60 @@ mod tests {
             vec![metta!((F aa))],
             vec![metta!((Error ({ChangeStateOp{}} {faa} (F b)) (BadArgType 2 A B)))],
         ]));
+    }
+
+    #[test]
+    fn recursive_state_display_and_equality() {
+        let left = StateAtom::new(sym!("leaf"), sym!("Type"));
+        let right = StateAtom::new(sym!("leaf"), sym!("Type"));
+        assert_eq!(left, right);
+        assert_eq!(left.to_string(), "(State leaf)");
+
+        left.state.borrow_mut().0 = Atom::expr([sym!("wrap"), Atom::gnd(left.clone())]);
+        right.state.borrow_mut().0 = Atom::expr([sym!("wrap"), Atom::gnd(right.clone())]);
+        assert_eq!(left.to_string(), "(State (wrap (State <cycle>)))");
+        assert_eq!(format!("{left:?}"), left.to_string());
+        assert_eq!(left, right);
+        assert_eq!(left, left.clone());
+
+        right.state.borrow_mut().0 = Atom::expr([sym!("other"), Atom::gnd(right.clone())]);
+        assert_ne!(left, right);
+        right.state.borrow_mut().0 = sym!("leaf");
+        assert_ne!(left, right);
+        left.state.borrow_mut().0 = sym!("leaf");
+        assert_eq!(left, right);
+        assert_eq!(left.to_string(), "(State leaf)");
+    }
+
+    #[test]
+    fn mutually_recursive_state_observation() {
+        let first = StateAtom::new(sym!("leaf"), sym!("Type"));
+        let second = StateAtom::new(sym!("leaf"), sym!("Type"));
+        first.state.borrow_mut().0 = Atom::gnd(second.clone());
+        second.state.borrow_mut().0 = Atom::gnd(first.clone());
+        assert_eq!(first.to_string(), "(State (State (State <cycle>)))");
+        assert_eq!(first, second);
+        second.state.borrow_mut().1 = sym!("DifferentType");
+        assert_ne!(first, second);
+        first.state.borrow_mut().0 = sym!("leaf");
+        second.state.borrow_mut().0 = sym!("leaf");
+    }
+
+    #[test]
+    fn state_display_guard_survives_formatter_failure() {
+        struct FailingWriter;
+        impl std::fmt::Write for FailingWriter {
+            fn write_str(&mut self, _: &str) -> std::fmt::Result { Err(std::fmt::Error) }
+        }
+        let state = StateAtom::new(sym!("leaf"), sym!("Type"));
+        assert!(std::fmt::write(&mut FailingWriter, format_args!("{state}")).is_err());
+        assert_eq!(state.to_string(), "(State leaf)");
+    }
+
+    #[test]
+    fn state_identity_does_not_make_nan_equal() {
+        use hyperon_atom::gnd::number::Number;
+        let state = StateAtom::new(Atom::gnd(Number::Float(f64::NAN)), sym!("Number"));
+        assert_ne!(state, state.clone());
     }
 }

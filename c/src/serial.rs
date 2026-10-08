@@ -144,7 +144,9 @@ impl serial::Serializer for RustToCSerializer {
         self.call_serialize(self.api().serialize_double, v)
     }
     fn serialize_str(&mut self, v: &str) -> serial::Result {
-        self.call_serialize(self.api().serialize_str, str_as_cstr(v).as_ptr())
+        // This callback's protocol is NUL-terminated, not a byte-span protocol.
+        let text = std::ffi::CString::new(v).map_err(|_| serial::Error::NotSupported)?;
+        self.call_serialize(self.api().serialize_str, text.as_ptr())
     }
 }
 

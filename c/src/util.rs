@@ -21,6 +21,43 @@ pub fn string_as_cstr(s: String) -> CString {
     CString::new(s).expect("CString::new failed")
 }
 
+/// Encode a diagnostic for the C API without truncating at an embedded NUL.
+/// Ordinary messages are unchanged; NULs are rendered as the visible escape `\0`.
+pub(crate) fn diagnostic_as_cstr(s: String) -> CString {
+    match CString::new(s) {
+        Ok(message) => message,
+        Err(error) => {
+            let bytes = error.into_vec();
+            let mut escaped = Vec::with_capacity(bytes.len());
+            for byte in bytes {
+                if byte == 0 {
+                    escaped.extend_from_slice(b"\\0");
+                } else {
+                    escaped.push(byte);
+                }
+            }
+            CString::new(escaped).expect("diagnostic NULs were escaped")
+        }
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::diagnostic_as_cstr;
+
+    #[test]
+    fn ordinary_diagnostics_are_unchanged() {
+        for message in ["", "ordinary error", "Unicode: ٣"] {
+            assert_eq!(diagnostic_as_cstr(message.into()).to_bytes(), message.as_bytes());
+        }
+    }
+
+    #[test]
+    fn embedded_nuls_are_visible_and_do_not_truncate_diagnostics() {
+        assert_eq!(diagnostic_as_cstr("before\0after\0".into()).to_bytes(), b"before\\0after\\0");
+    }
+}
+
 pub(crate) fn write_into_buf<T: std::fmt::Display>(obj: T, buf: *mut c_char, buf_len: usize) -> usize {
 
     //If buf_len == 0, the caller is just interested in the size of buffer they will need

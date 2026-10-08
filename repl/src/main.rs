@@ -77,8 +77,12 @@ fn main() -> Result<()> {
 
         //Only print the output from the primary .metta file
         let metta_file = std::io::BufReader::new(std::fs::File::open(metta_file)?);
-        metta.exec(metta_file);
+        let exec_result = metta.exec(metta_file);
         metta.print_result();
+        if let Err(err) = exec_result {
+            eprintln!("Error: {}", err);
+            std::process::exit(1);
+        }
         Ok(())
 
     } else {
@@ -98,12 +102,12 @@ fn show_welcome_message() {
 fn start_interactive_mode(repl_params: ReplParams, mut metta: MettaShim) -> rustyline::Result<()> {
 
     //Run the built-in repl-init code
-    metta.exec(builtin_init_metta_code().as_str());
+    metta.exec(builtin_init_metta_code().as_str()).unwrap_or_else(|err| eprintln!("Error: {}", err));
 
     //Run the repl init file
     if let Some(repl_config_metta_path) = &repl_params.repl_config_metta_path {
         let init_metta_file = std::io::BufReader::new(std::fs::File::open(repl_config_metta_path)?);
-        metta.exec(init_metta_file);
+        metta.exec(init_metta_file).unwrap_or_else(|err| eprintln!("Error: {}", err));
     }
 
     let max_len = metta.get_config_int(CFG_HISTORY_MAX_LEN).unwrap_or_else(|| 500);
@@ -158,8 +162,11 @@ fn start_interactive_mode(repl_params: ReplParams, mut metta: MettaShim) -> rust
                 rl.add_history_entry(line.as_str())?;
 
                 let mut metta = rl.helper().unwrap().metta.borrow_mut();
-                metta.exec(line.as_str());
+                let exec_result = metta.exec(line.as_str());
                 metta.print_result();
+                if let Err(err) = exec_result {
+                    eprintln!("Error: {}", err);
+                }
             }
             Err(ReadlineError::Interrupted) |
             Err(ReadlineError::Eof) => {
